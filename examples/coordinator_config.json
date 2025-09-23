@@ -1,0 +1,17 @@
+{
+  "coordinator": {
+    "coordinator_id": "main_coordinator",
+    "host": "0.0.0.0",
+    "port": 8000,
+    "known_nodes": [],
+    "heartbeat_interval": 30,
+    "search_timeout": 60
+  },
+  "search": {
+    "max_results": 100,
+    "case_sensitive": false,
+    "regex_enabled": true,
+    "fuzzy_search": false,
+    "fuzzy_threshold": 0.8
+  }
+}

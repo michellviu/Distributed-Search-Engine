@@ -1,0 +1,31 @@
+{
+  "node": {
+    "node_id": "example_node_1",
+    "host": "0.0.0.0",
+    "port": 8001,
+    "max_connections": 100,
+    "search_directories": [
+      "/home/documents",
+      "/var/log",
+      "/etc"
+    ],
+    "allowed_file_types": [
+      ".txt",
+      ".md",
+      ".py",
+      ".js",
+      ".json",
+      ".log",
+      ".conf",
+      ".cfg"
+    ],
+    "max_file_size_mb": 50
+  },
+  "search": {
+    "max_results": 100,
+    "case_sensitive": false,
+    "regex_enabled": true,
+    "fuzzy_search": true,
+    "fuzzy_threshold": 0.8
+  }
+}

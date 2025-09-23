@@ -1,0 +1,1 @@
+# Core module for distributed search engine components
