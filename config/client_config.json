@@ -1,0 +1,11 @@
+{
+    "server": {
+        "host": "localhost",
+        "port": 5000
+    },
+    "logging": {
+        "level": "INFO",
+        "file": "logs/client.log",
+        "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    }
+}
