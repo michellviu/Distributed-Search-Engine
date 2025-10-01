@@ -1,0 +1,22 @@
+{
+    "server": {
+        "host": "localhost",
+        "port": 5000,
+        "max_connections": 5
+    },
+    "indexer": {
+        "base_path": "./shared_files",
+        "auto_index": true,
+        "watch_changes": true
+    },
+    "transfer": {
+        "chunk_size": 4096,
+        "max_retries": 3,
+        "timeout": 30
+    },
+    "logging": {
+        "level": "INFO",
+        "file": "logs/server.log",
+        "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    }
+}

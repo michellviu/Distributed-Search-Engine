@@ -1,0 +1,9 @@
+# Core dependencies for Distributed Search Engine
+# Python 3.8+
+
+# No external dependencies required for basic functionality
+# All features use Python standard library
+
+# Optional dependencies for enhanced features:
+# pytest>=7.0.0  # For running tests
+# pytest-cov>=4.0.0  # For test coverage

@@ -61,6 +61,15 @@ local_settings.py
 db.sqlite3
 db.sqlite3-journal
 
+# Project specific
+logs/
+# Keep shared_files directory structure but not the example files
+shared_files/*.txt
+shared_files/*.pdf
+shared_files/*.doc
+shared_files/*.docx
+!shared_files/README.md
+
 # Flask stuff:
 instance/
 .webassets-cache
