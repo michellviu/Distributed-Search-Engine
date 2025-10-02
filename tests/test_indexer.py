@@ -11,7 +11,7 @@ import sys
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
 
-from indexer.indexer import DocumentIndexer
+from src.indexer.indexer import DocumentIndexer
 
 
 class TestDocumentIndexer(unittest.TestCase):

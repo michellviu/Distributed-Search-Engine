@@ -5,7 +5,7 @@
         "max_connections": 5
     },
     "indexer": {
-        "base_path": "./shared_files",
+        "base_path": "shared_files",
         "auto_index": true,
         "watch_changes": true
     },

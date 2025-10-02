@@ -20,7 +20,7 @@ class Config:
             'max_connections': 5
         },
         'indexer': {
-            'base_path': './shared_files',
+            'base_path': 'shared_files',
             'auto_index': True,
             'watch_changes': True
         },
