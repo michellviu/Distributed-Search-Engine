@@ -1,0 +1,8 @@
+# GUI Dependencies for Distributed Search Engine
+# Install with: pip install -r requirements-gui.txt
+
+# Modern Tkinter with beautiful themes (optional but recommended)
+customtkinter>=5.2.0
+
+# Alternative: PyQt5 (if you prefer Qt over Tkinter)
+# PyQt5>=5.15.0
