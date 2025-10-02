@@ -33,22 +33,36 @@ class FileTransfer:
             True if successful, False otherwise
         """
         try:
+            import hashlib
+            
             path = Path(file_path)
             if not path.exists():
                 self.logger.error(f"File does not exist: {file_path}")
                 return False
                 
             file_size = path.stat().st_size
+            file_name = path.name
             
-            # Send file metadata
-            metadata = f"{path.name}|{file_size}".encode()
-            socket_conn.sendall(metadata)
+            # Calculate file hash
+            sha256_hash = hashlib.sha256()
+            with open(file_path, "rb") as f:
+                for byte_block in iter(lambda: f.read(4096), b""):
+                    sha256_hash.update(byte_block)
+            file_hash = sha256_hash.hexdigest()
             
-            # Wait for acknowledgment
-            ack = socket_conn.recv(1024)
-            if ack != b"READY":
-                self.logger.error("Failed to receive ready acknowledgment")
-                return False
+            # Send file size (16 bytes, right-aligned)
+            size_str = f"{file_size:>16}"
+            socket_conn.sendall(size_str.encode())
+            
+            # Send file name length (4 bytes, right-aligned)
+            name_len_str = f"{len(file_name):>4}"
+            socket_conn.sendall(name_len_str.encode())
+            
+            # Send file name
+            socket_conn.sendall(file_name.encode('utf-8'))
+            
+            # Send file hash (64 bytes)
+            socket_conn.sendall(file_hash.encode('utf-8'))
             
             # Send file content
             with open(file_path, 'rb') as f:
@@ -79,13 +93,25 @@ class FileTransfer:
             Path to saved file if successful, None otherwise
         """
         try:
-            # Receive file metadata
-            metadata = socket_conn.recv(1024).decode()
-            file_name, file_size_str = metadata.split('|')
-            file_size = int(file_size_str)
+            # Receive file size (16 bytes)
+            size_data = socket_conn.recv(16)
+            if not size_data:
+                self.logger.error("Failed to receive file size")
+                return None
+            file_size = int(size_data.decode().strip())
             
-            # Send ready acknowledgment
-            socket_conn.sendall(b"READY")
+            # Receive file name length (4 bytes)
+            name_len_data = socket_conn.recv(4)
+            if not name_len_data:
+                self.logger.error("Failed to receive file name length")
+                return None
+            name_length = int(name_len_data.decode().strip())
+            
+            # Receive file name
+            file_name = socket_conn.recv(name_length).decode('utf-8')
+            
+            # Receive file hash (64 bytes)
+            file_hash = socket_conn.recv(64).decode('utf-8')
             
             # Prepare destination
             dest_path = Path(destination_dir) / file_name
@@ -105,6 +131,13 @@ class FileTransfer:
                     
             if bytes_received == file_size:
                 self.logger.info(f"Received file {file_name} ({bytes_received} bytes)")
+                
+                # Verify file integrity
+                if self.verify_file(str(dest_path), file_hash):
+                    self.logger.info(f"File integrity verified: {file_name}")
+                else:
+                    self.logger.warning(f"File integrity check failed: {file_name}")
+                
                 return str(dest_path)
             else:
                 self.logger.error(
