@@ -19,6 +19,13 @@ setup(
     url="https://github.com/michellviu/Distributed-Search-Engine",
     packages=find_packages(where="src"),
     package_dir={"": "src"},
+    py_modules=["main_server", "main_client"],  # incluir módulos sueltos
+    entry_points={
+        "console_scripts": [
+            "search-server=main_server:main",
+            "search-client=main_client:main",
+        ],
+    },
     classifiers=[
         "Development Status :: 3 - Alpha",
         "Intended Audience :: Education",
