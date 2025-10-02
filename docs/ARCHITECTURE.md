@@ -6,7 +6,7 @@ Este proyecto implementa un buscador de documentos distribuidos en su versión c
 
 ## Estructura de Directorios
 
-```
+```text
 Distributed-Search-Engine/
 ├── src/                      # Código fuente principal
 │   ├── server/              # Módulo del servidor
@@ -44,6 +44,7 @@ Distributed-Search-Engine/
 ## Componentes Principales
 
 ### 1. Servidor (`src/server/`)
+
 - **Función**: Gestiona las conexiones de clientes y coordina las búsquedas
 - **Características**:
   - Acepta múltiples conexiones concurrentes
@@ -51,6 +52,7 @@ Distributed-Search-Engine/
   - Coordina la transferencia de archivos
 
 ### 2. Cliente (`src/client/`)
+
 - **Función**: Permite a los usuarios buscar y descargar archivos
 - **Características**:
   - Envía consultas de búsqueda al servidor
@@ -58,6 +60,7 @@ Distributed-Search-Engine/
   - Manejo de errores de conexión
 
 ### 3. Indexador (`src/indexer/`)
+
 - **Función**: Indexa documentos para búsqueda eficiente
 - **Características**:
   - Indexa archivos por nombre y tipo
@@ -65,6 +68,7 @@ Distributed-Search-Engine/
   - Actualización dinámica del índice
 
 ### 4. Motor de Búsqueda (`src/search/`)
+
 - **Función**: Procesa consultas y devuelve resultados relevantes
 - **Características**:
   - Búsqueda por nombre de archivo
@@ -72,6 +76,7 @@ Distributed-Search-Engine/
   - Puntuación de relevancia
 
 ### 5. Transferencia de Archivos (`src/transfer/`)
+
 - **Función**: Gestiona la transferencia segura de archivos
 - **Características**:
   - Transferencia por chunks
@@ -79,6 +84,7 @@ Distributed-Search-Engine/
   - Manejo de errores de red
 
 ### 6. Utilidades (`src/utils/`)
+
 - **Función**: Proporciona funcionalidades comunes
 - **Características**:
   - Gestión de configuración (JSON)
@@ -90,15 +96,27 @@ Distributed-Search-Engine/
 ### Iniciar el Servidor
 
 ```bash
-cd src
-python main_server.py --host localhost --port 5000 --index-path ./shared_files
+# Desde la raíz del proyecto
+./start_server.sh
+
+# Alternativa manual
+python src/main_server.py --config config/server_config.json
+
+# Tras instalar el paquete (pip install -e .)
+search-server --config config/server_config.json
 ```
 
 ### Ejecutar el Cliente
 
 ```bash
-cd src
-python main_client.py --host localhost --port 5000 --query "documento"
+# Cliente interactivo sin instalación
+python src/client/client_interactive.py
+
+# Cliente CLI empaquetado
+search-client --query "documento" --host localhost --port 5000
+
+# Cliente programático
+python3 src/main_client.py --query "documento"
 ```
 
 ### Descargar un Archivo
@@ -111,10 +129,13 @@ python main_client.py --download FILE_ID --output ./downloads/file.txt
 ## Configuración
 
 Los archivos de configuración en formato JSON permiten personalizar:
+
 - Dirección y puerto del servidor
 - Directorio de archivos compartidos
 - Nivel de logging
 - Parámetros de transferencia
+
+El servidor utiliza `shared_files/` como base (`auto_index=true`) para indexar automáticamente el contenido cada vez que arranca.
 
 ## Características Implementadas
 

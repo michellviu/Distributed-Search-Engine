@@ -6,7 +6,7 @@ This document provides a complete overview of the file structure created for the
 
 ## Directory Tree
 
-```
+```text
 Distributed-Search-Engine/
 ├── README.md                         # Main project documentation
 ├── buscador.pdf                      # Project specifications (original)
@@ -104,18 +104,21 @@ Distributed-Search-Engine/
 ### Source Code (`src/`)
 
 #### Server Module (`src/server/`)
+
 - **server.py**: Main server implementation
   - `SearchServer` class
   - Connection handling
   - Request processing
 
 #### Client Module (`src/client/`)
+
 - **client.py**: Client implementation
   - `SearchClient` class
   - Search requests
   - File downloads
 
 #### Indexer Module (`src/indexer/`)
+
 - **indexer.py**: Document indexer
   - `DocumentIndexer` class
   - File indexing by name and type
@@ -123,6 +126,7 @@ Distributed-Search-Engine/
   - Directory scanning
 
 #### Search Module (`src/search/`)
+
 - **search_engine.py**: Search engine
   - `SearchEngine` class
   - Query processing
@@ -130,6 +134,7 @@ Distributed-Search-Engine/
   - Type-based filtering
 
 #### Transfer Module (`src/transfer/`)
+
 - **file_transfer.py**: File transfer handler
   - `FileTransfer` class
   - Chunked file transfer
@@ -137,6 +142,7 @@ Distributed-Search-Engine/
   - Error handling
 
 #### Utils Module (`src/utils/`)
+
 - **config.py**: Configuration management
   - `Config` class
   - JSON-based configuration
@@ -148,14 +154,16 @@ Distributed-Search-Engine/
   - Configurable log levels
 
 #### Entry Points
+
 - **main_server.py**: Server startup script
   - Command-line argument parsing
   - Component initialization
+  - Automatic indexing of `shared_files`
   - Server startup
 
 - **main_client.py**: Client startup script
   - Command-line argument parsing
-  - Search and download operations
+  - Search, index, list and download operations
 
 ### Tests (`tests/`)
 
@@ -172,15 +180,16 @@ Distributed-Search-Engine/
 ### Data Directories
 
 - **shared_files/**: Directory for files to be shared and indexed
+  - Automatically indexed on server startup
+  - `start_server.sh` seeds sample documents if empty
   - Contains README.md with usage instructions
-  - Example files excluded from git
 
 - **logs/**: Runtime log files (created automatically)
   - Excluded from git
 
 ## Module Dependencies
 
-```
+```text
 main_server.py
 ├── server.server (SearchServer)
 ├── indexer.indexer (DocumentIndexer)
@@ -225,20 +234,41 @@ FileTransfer
 ## Usage Summary
 
 ### Start Server
+
 ```bash
-cd src
-python3 main_server.py --host localhost --port 5000 --index-path ./shared_files
+# Opción rápida
+./start_server.sh
+
+# Opción manual
+python3 src/main_server.py --config config/server_config.json
 ```
 
 ### Run Client
+
 ```bash
-cd src
-python3 main_client.py --query "documento"
+# Cliente interactivo
+python3 src/client/client_interactive.py
+
+# Cliente programático
+python3 src/main_client.py --query "documento"
 ```
 
 ### Run Tests
+
 ```bash
-python3 -m unittest discover tests/ -v
+# Pruebas unitarias
+pytest
+
+# Prueba de integración guiada
+./test_integration.py
+```
+
+### Paquete Instalado con setup.py
+
+```bash
+pip install -e .
+search-server --config config/server_config.json
+search-client --query "documento"
 ```
 
 ## Design Principles
