@@ -9,22 +9,26 @@ from pathlib import Path
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent))
 
-from server.server import SearchServer
+from server.server import SearchServer, InMemoryDocumentRepository
 from indexer.indexer import DocumentIndexer
 from search.search_engine import SearchEngine
+from transfer.file_transfer import FileTransfer
 from utils.config import Config
 from utils.logger import setup_logging
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
 
 
 def main():
     """Main function to start the server"""
+    default_config_path = ROOT_DIR / 'config' / 'server_config.json'
     parser = argparse.ArgumentParser(
         description='Centralized Document Search Engine Server'
     )
     parser.add_argument(
         '--config',
         type=str,
-        default='../config/server_config.json',
+        default=str(default_config_path),
         help='Path to configuration file'
     )
     parser.add_argument(
@@ -63,12 +67,18 @@ def main():
     
     # Get indexer configuration
     indexer_config = config.get('indexer')
-    index_path = args.index_path or indexer_config.get('base_path', './shared_files')
+    index_path = args.index_path or indexer_config.get('base_path', 'shared_files')
     
-    # Initialize components
+    # Initialize components with dependency injection
     indexer = DocumentIndexer(index_path)
     search_engine = SearchEngine(indexer)
-    server = SearchServer(host, port)
+    file_transfer = FileTransfer()
+    
+    # Create repository (abstraction layer for easy migration to MongoDB)
+    repository = InMemoryDocumentRepository(indexer, search_engine)
+    
+    # Create server with injected dependencies
+    server = SearchServer(host, port, repository, file_transfer)
     
     # Index initial files if path exists
     if Path(index_path).exists():
@@ -80,6 +90,8 @@ def main():
     
     # Start server
     print(f"Starting server on {host}:{port}")
+    print("Available actions: search, index, download, list")
+    print("Press Ctrl+C to stop the server")
     try:
         server.start()
     except KeyboardInterrupt:

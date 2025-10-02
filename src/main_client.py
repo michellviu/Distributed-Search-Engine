@@ -13,16 +13,19 @@ from client.client import SearchClient
 from utils.config import Config
 from utils.logger import setup_logging
 
+ROOT_DIR = Path(__file__).resolve().parent.parent
+
 
 def main():
     """Main function to run the client"""
+    default_config_path = ROOT_DIR / 'config' / 'client_config.json'
     parser = argparse.ArgumentParser(
         description='Centralized Document Search Engine Client'
     )
     parser.add_argument(
         '--config',
         type=str,
-        default='../config/client_config.json',
+        default=str(default_config_path),
         help='Path to configuration file'
     )
     parser.add_argument(
