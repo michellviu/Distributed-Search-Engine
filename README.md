@@ -1,110 +1,192 @@
 # Distributed-Search-Engine
 
-📖 **Project Description**
+📖 **Proyecto de Sistema de Búsqueda Distribuida**
 
-This project focuses on the development of a distributed document search system, created as part of the Distributed Systems course.
+Este proyecto implementa un motor de búsqueda de documentos centralizado, desarrollado como parte del curso de Sistemas Distribuidos.
 
-## Overview
+## Descripción General
 
-The Distributed Search Engine is a system for searching and accessing documents across multiple computers. This repository contains the **centralized version** of the system, which implements a client-server architecture where:
+El Motor de Búsqueda Distribuida es un sistema para buscar y acceder a documentos a través de múltiples computadoras. Este repositorio contiene la **versión centralizada** del sistema, que implementa una arquitectura cliente-servidor donde:
 
-- A central server manages document indexing and search queries
-- Clients can search for documents and download them
-- Files are indexed by name and type for efficient searching
-- Duplicate files are detected using hash-based identification
+- Un servidor central gestiona la indexación de documentos y consultas de búsqueda
+- Los clientes pueden buscar documentos, indexar archivos y descargarlos
+- Los archivos se indexan automáticamente por nombre y tipo para búsquedas eficientes
+- Los archivos duplicados se detectan utilizando identificación basada en hash
+- El servidor indexa automáticamente `shared_files/` al iniciar
 
-## Features
+## Características
 
-- 🔍 **Document Search**: Search files by name and type
-- 📂 **File Indexing**: Automatic indexing of shared directories
-- 🔄 **File Transfer**: Reliable file download with error handling
-- 🔐 **Duplicate Detection**: Hash-based duplicate file identification
-- ⚙️ **Configurable**: JSON-based configuration system
-- 📝 **Logging**: Comprehensive logging for debugging and monitoring
+- 🔍 **Búsqueda de Documentos**: Buscar archivos por nombre y tipo
+- 📂 **Indexación Automática**: Indexación automática de directorios compartidos al arranque
+- � **Operaciones Múltiples**: Búsqueda, indexación, listado y descarga de archivos
+- 🔄 **Transferencia de Archivos**: Descarga confiable con manejo de errores y reintentos
+- 🔐 **Detección de Duplicados**: Identificación de archivos duplicados basada en hash
+- ⚙️ **Configurable**: Sistema de configuración basado en JSON
+- 📝 **Logging**: Registro completo para depuración y monitoreo
+- 🧪 **Probado**: Suite completa de pruebas unitarias e integración
 
-## Project Structure
+## Estructura del Proyecto
 
-```
+```text
 Distributed-Search-Engine/
-├── src/                      # Source code
-│   ├── server/              # Server implementation
-│   ├── client/              # Client implementation
-│   ├── indexer/             # Document indexing
-│   ├── search/              # Search engine
-│   ├── transfer/            # File transfer
-│   ├── utils/               # Utilities (config, logging)
-│   ├── main_server.py       # Server entry point
-│   └── main_client.py       # Client entry point
-├── config/                   # Configuration files
-├── tests/                    # Unit tests
-├── docs/                     # Documentation
-├── requirements.txt          # Python dependencies
-└── setup.py                 # Installation script
+├── src/                      # Código fuente
+│   ├── server/              # Implementación del servidor
+│   ├── client/              # Implementación del cliente
+│   │   └── client_interactive.py  # Cliente interactivo CLI
+│   ├── indexer/             # Indexación de documentos
+│   ├── search/              # Motor de búsqueda
+│   ├── transfer/            # Transferencia de archivos
+│   ├── utils/               # Utilidades (config, logging)
+│   ├── main_server.py       # Punto de entrada del servidor
+│   └── main_client.py       # Punto de entrada del cliente
+├── config/                   # Archivos de configuración JSON
+├── tests/                    # Pruebas unitarias y de integración
+├── docs/                     # Documentación detallada
+│   ├── QUICKSTART.md        # Guía de inicio rápido (muy detallada)
+│   ├── ARCHITECTURE.md      # Documentación de arquitectura
+│   └── PROJECT_STRUCTURE.md # Estructura completa del proyecto
+├── shared_files/             # Directorio indexado automáticamente
+├── logs/                     # Logs generados en tiempo de ejecución
+├── start_server.sh           # Script de inicio rápido del servidor
+├── requirements.txt          # Dependencias de Python
+└── setup.py                 # Script de instalación con entry points
 ```
 
-For detailed architecture documentation, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+Para documentación detallada de arquitectura, consulta [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-## Requirements
+Para una guía completa de inicio rápido, ve a [docs/QUICKSTART.md](docs/QUICKSTART.md).
 
-- Python 3.8 or higher
-- No external dependencies (uses Python standard library)
+## Requisitos
 
-## Installation
+- Python 3.10 o superior (recomendado)
+- `pip` actualizado
+- Sin dependencias externas en producción (usa la biblioteca estándar de Python)
+- Para desarrollo: `pytest` (instalado con `pip install -e .[dev]`)
+
+## Instalación
+
+### Opción 1: Instalación Editable (Recomendada para desarrollo)
 
 ```bash
-# Clone the repository
+# Clonar el repositorio
 git clone https://github.com/michellviu/Distributed-Search-Engine.git
 cd Distributed-Search-Engine
 
-# Install the package (optional)
-pip install -e .
+# Crear entorno virtual (opcional pero recomendado)
+python3 -m venv .venv
+source .venv/bin/activate  # En Windows: .venv\Scripts\activate
+
+# Instalar el paquete con herramientas de desarrollo
+pip install -e .[dev]
 ```
 
-## Usage
+Esto instala el paquete y expone los comandos:
 
-### Starting the Server
+- `search-server` - Iniciar el servidor
+- `search-client` - Ejecutar el cliente
+
+### Opción 2: Uso Directo sin Instalación
 
 ```bash
-cd src
-python main_server.py --host localhost --port 5000 --index-path ./shared_files
+# Clonar el repositorio
+git clone https://github.com/michellviu/Distributed-Search-Engine.git
+cd Distributed-Search-Engine
+
+# Instalar solo dependencias mínimas (vacías actualmente)
+pip install -r requirements.txt
 ```
 
-Options:
-- `--config`: Path to configuration file (default: `../config/server_config.json`)
-- `--host`: Server host address (default: `localhost`)
-- `--port`: Server port number (default: `5000`)
-- `--index-path`: Directory to index files from (default: `./shared_files`)
+## Uso Rápido
 
-### Running the Client
+### Iniciar el Servidor
 
-Search for files:
+#### Opción 1: Script de Inicio (Más Fácil)
+
 ```bash
-cd src
-python main_client.py --host localhost --port 5000 --query "document"
+./start_server.sh
 ```
 
-Download a file:
+El script:
+
+- Crea directorios necesarios (`logs/`, `downloads/`)
+- Genera archivos de ejemplo en `shared_files/` si está vacío
+- Indexa automáticamente todos los archivos al iniciar
+- Inicia el servidor en `localhost:5000`
+
+#### Opción 2: Comando Directo
+
 ```bash
-cd src
-python main_client.py --host localhost --port 5000 --download FILE_ID --output ./downloads/file.txt
+# Desde el directorio raíz del proyecto
+python3 src/main_server.py --config config/server_config.json
+
+# O, si instalaste el paquete:
+search-server --config config/server_config.json
 ```
 
-Options:
-- `--config`: Path to configuration file (default: `../config/client_config.json`)
-- `--host`: Server host address (default: `localhost`)
-- `--port`: Server port number (default: `5000`)
-- `--query`: Search query to execute
-- `--download`: File ID to download
-- `--output`: Output path for downloaded file
+**Opciones del Servidor:**
 
-## Configuration
+- `--config <path>`: Ruta al archivo de configuración
+- `--host <address>`: Dirección del servidor (default: `localhost`)
+- `--port <number>`: Puerto del servidor (default: `5000`)
+- `--index-path <path>`: Directorio a indexar (default: `shared_files`)
 
-Configuration files are located in the `config/` directory:
+### Usar el Cliente
 
-- `server_config.json`: Server configuration (host, port, indexing settings)
-- `client_config.json`: Client configuration (server connection, logging)
+### Cliente Interactivo (Recomendado)
 
-Example server configuration:
+```bash
+python3 src/client/client_interactive.py
+```
+
+Comandos disponibles en la sesión interactiva:
+
+- `search <query> [extension]` - Buscar documentos
+- `list` - Listar todos los archivos indexados
+- `index <ruta>` - Indexar un archivo nuevo
+- `download <nombre> <destino>` - Descargar archivo
+- `quit` - Salir
+
+### Cliente CLI (después de instalar el paquete)
+
+```bash
+# Buscar archivos
+search-client --query "python"
+
+# Descargar un archivo
+search-client --download python_doc.txt --output ./downloads/
+
+# Con opciones de conexión personalizadas
+search-client --query "documento" --host localhost --port 5000
+```
+
+### Cliente Programático (sin instalación)
+
+```bash
+# Buscar archivos
+python3 src/main_client.py --query "documento"
+
+# Descargar un archivo
+python3 src/main_client.py --download archivo.txt --output ./downloads/archivo.txt
+```
+
+**Opciones del Cliente:**
+
+- `--config <path>`: Ruta al archivo de configuración
+- `--host <address>`: Dirección del servidor (default: `localhost`)
+- `--port <number>`: Puerto del servidor (default: `5000`)
+- `--query <text>`: Consulta de búsqueda
+- `--download <name>`: Nombre del archivo a descargar
+- `--output <path>`: Ruta destino para el archivo descargado
+
+## Configuración
+
+Los archivos de configuración están ubicados en el directorio `config/`:
+
+- `server_config.json`: Configuración del servidor (host, puerto, indexación)
+- `client_config.json`: Configuración del cliente (conexión, logging)
+
+**Ejemplo de configuración del servidor:**
+
 ```json
 {
     "server": {
@@ -113,55 +195,119 @@ Example server configuration:
         "max_connections": 5
     },
     "indexer": {
-        "base_path": "./shared_files",
-        "auto_index": true
+        "base_path": "shared_files",
+        "auto_index": true,
+        "watch_changes": true
+    },
+    "transfer": {
+        "chunk_size": 4096,
+        "max_retries": 3,
+        "timeout": 30
     },
     "logging": {
         "level": "INFO",
-        "file": "logs/server.log"
+        "file": "logs/server.log",
+        "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     }
 }
 ```
 
-## Development
+**Características de Configuración:**
 
-### Running Tests
+- **Auto-indexación**: El servidor indexa automáticamente `shared_files/` al iniciar
+- **Rutas relativas**: Todas las rutas son relativas al directorio raíz del proyecto
+- **Transferencia configurable**: Tamaño de chunk, reintentos y timeout ajustables
+- **Logging flexible**: Nivel de log configurable (DEBUG, INFO, WARNING, ERROR)
+
+## Desarrollo
+
+### Ejecutar Pruebas
 
 ```bash
-# Install test dependencies
+# Instalar dependencias de prueba (si no usaste pip install -e .[dev])
 pip install pytest pytest-cov
 
-# Run tests
-pytest tests/
+# Ejecutar todas las pruebas
+pytest
 
-# Run with coverage
+# Ejecutar pruebas con cobertura
 pytest --cov=src tests/
+
+# Ejecutar pruebas específicas
+pytest tests/test_indexer.py
+pytest tests/test_search.py
+
+# Ejecutar prueba de integración guiada
+python3 tests/test_integration.py
 ```
 
-## Project Specifications
+### Estructura de las Pruebas
 
-This project implements a distributed document search system with the following characteristics:
+- `tests/test_indexer.py` - Pruebas del módulo de indexación
+- `tests/test_search.py` - Pruebas del motor de búsqueda
+- `tests/test_integration.py` - Pruebas de integración extremo a extremo
 
-- **Centralized Architecture**: Client-server model with a central indexing server
-- **File Search**: Search by file name and type
-- **Duplicate Detection**: Identify duplicate files with different names
-- **Error Handling**: Robust error handling for network and file transfer issues
-- **Efficient Search**: Optimized search algorithms for quick response times
+### Añadir Archivos para Indexar
 
-For the complete project specifications, see [buscador.pdf](buscador.pdf).
+Simplemente coloca archivos en el directorio `shared_files/` y reinicia el servidor:
 
-## Future Enhancements
+```bash
+cp mi_documento.txt shared_files/
+./start_server.sh
+```
 
-- Distributed peer-to-peer architecture
-- Automatic node discovery
-- Index replication across nodes
-- Intelligent source selection for file downloads
-- Fault tolerance mechanisms
+El servidor los indexará automáticamente al iniciar.
 
-## License
+## Especificaciones del Proyecto
 
-This project is created for educational purposes as part of the Distributed Systems course.
+Este proyecto implementa un sistema de búsqueda de documentos distribuido con las siguientes características:
 
-## Contributors
+- **Arquitectura Centralizada**: Modelo cliente-servidor con servidor central de indexación
+- **Búsqueda de Archivos**: Búsqueda por nombre de archivo y tipo
+- **Indexación Automática**: El servidor indexa `shared_files/` al arranque
+- **Operaciones Múltiples**: SEARCH, INDEX, DOWNLOAD, LIST
+- **Detección de Duplicados**: Identifica archivos duplicados con diferentes nombres usando hash
+- **Manejo de Errores**: Manejo robusto de errores de red y transferencia de archivos
+- **Búsqueda Eficiente**: Algoritmos de búsqueda optimizados con puntuación de relevancia
+- **Transferencia Confiable**: Transferencia por chunks con verificación de integridad y reintentos
+- **Patrones de Diseño**: Repository Pattern y Command Pattern para extensibilidad
 
-Developed as part of the Distributed Systems course project. 
+Para las especificaciones completas del proyecto, consulta [buscador.pdf](buscador.pdf).
+
+## Documentación
+
+- 📖 [**QUICKSTART.md**](docs/QUICKSTART.md) - Guía detallada de instalación, configuración y uso
+- 📖 [**ARCHITECTURE.md**](docs/ARCHITECTURE.md) - Documentación de arquitectura y componentes
+- 📖 [**PROJECT_STRUCTURE.md**](docs/PROJECT_STRUCTURE.md) - Estructura completa y descripción de módulos
+
+## Mejoras Futuras
+
+- Arquitectura distribuida peer-to-peer
+- Descubrimiento automático de nodos
+- Replicación de índices entre nodos
+- Selección inteligente de fuentes para descarga de archivos
+- Mecanismos de tolerancia a fallos
+- Búsqueda por contenido (no solo nombre)
+- Interfaz web
+
+## Solución de Problemas
+
+| Problema | Solución |
+|----------|----------|
+| `Connection refused` | Asegúrate de que el servidor esté ejecutándose con `./start_server.sh` |
+| `No module named 'src'` | Ejecuta los comandos desde el directorio raíz del proyecto |
+| `Permission denied` | Otorga permisos de ejecución: `chmod +x start_server.sh` |
+| Archivos no aparecen | Verifica que estén en `shared_files/` y reinicia el servidor |
+| Ver logs del servidor | `tail -f logs/server.log` |
+
+## Licencia
+
+Este proyecto es creado con fines educativos como parte del curso de Sistemas Distribuidos.
+
+## Contribuidores
+
+Desarrollado como parte del proyecto del curso de Sistemas Distribuidos.
+
+---
+
+**¿Necesitas ayuda?** Consulta la [Guía de Inicio Rápido](docs/QUICKSTART.md) para instrucciones detalladas.
