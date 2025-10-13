@@ -131,39 +131,82 @@ class SearchCommand(Command):
 class IndexCommand(Command):
     """Command for indexing a new document"""
     
-    def __init__(self, repository: DocumentRepository, file_path: str):
+    def __init__(self, repository: DocumentRepository, file_path: str = None, 
+                 file_name: str = None, file_content: bytes = None):
         self.repository = repository
-        self.file_path = file_path
+        self.file_path = file_path  # For backward compatibility
+        self.file_name = file_name  # New: file name from client
+        self.file_content = file_content  # New: file content from client
         self.logger = logging.getLogger(__name__)
     
     def execute(self) -> Dict[str, Any]:
         """Execute indexing and return result"""
         try:
-            self.logger.info(f"Executing index: file='{self.file_path}'")
+            # New behavior: If file content is provided, save it first
+            if self.file_content is not None and self.file_name:
+                self.logger.info(f"Executing index with uploaded content: file='{self.file_name}'")
+                
+                # Save file to shared_files directory
+                shared_files_dir = Path('shared_files')
+                shared_files_dir.mkdir(exist_ok=True)
+                
+                target_path = shared_files_dir / self.file_name
+                with open(target_path, 'wb') as f:
+                    f.write(self.file_content)
+                
+                self.logger.info(f"File saved to: {target_path}")
+                
+                # Index the saved file
+                success = self.repository.index_file(str(target_path))
+                
+                if success:
+                    return {
+                        'status': 'success',
+                        'action': 'index',
+                        'file_path': str(target_path),
+                        'message': 'File uploaded and indexed successfully'
+                    }
+                else:
+                    return {
+                        'status': 'error',
+                        'action': 'index',
+                        'message': 'File uploaded but indexing failed'
+                    }
             
-            # Verify file exists
-            if not Path(self.file_path).exists():
-                return {
-                    'status': 'error',
-                    'action': 'index',
-                    'message': f"File not found: {self.file_path}"
-                }
-            
-            success = self.repository.index_file(self.file_path)
-            
-            if success:
-                return {
-                    'status': 'success',
-                    'action': 'index',
-                    'file_path': self.file_path,
-                    'message': 'File indexed successfully'
-                }
+            # Old behavior: file_path provided (for backward compatibility)
+            elif self.file_path:
+                self.logger.info(f"Executing index: file='{self.file_path}'")
+                
+                # Verify file exists
+                if not Path(self.file_path).exists():
+                    return {
+                        'status': 'error',
+                        'action': 'index',
+                        'message': f"File not found: {self.file_path}"
+                    }
+                
+                success = self.repository.index_file(self.file_path)
+                
+                if success:
+                    return {
+                        'status': 'success',
+                        'action': 'index',
+                        'file_path': self.file_path,
+                        'message': 'File indexed successfully'
+                    }
+                else:
+                    return {
+                        'status': 'error',
+                        'action': 'index',
+                        'message': 'Failed to index file'
+                    }
             else:
                 return {
                     'status': 'error',
                     'action': 'index',
-                    'message': 'Failed to index file'
+                    'message': 'No file path or content provided'
                 }
+                
         except Exception as e:
             self.logger.error(f"Index command failed: {e}")
             return {
@@ -257,12 +300,13 @@ class CommandFactory:
         self.file_transfer = file_transfer
         self.logger = logging.getLogger(__name__)
     
-    def create_command(self, request: Dict[str, Any]) -> Optional[Command]:
+    def create_command(self, request: Dict[str, Any], file_content: bytes = None) -> Optional[Command]:
         """
         Create a command based on the request
         
         Args:
             request: Dictionary with 'action' and other parameters
+            file_content: Optional file content for index operations
             
         Returns:
             Command instance or None if invalid
@@ -275,8 +319,17 @@ class CommandFactory:
             return SearchCommand(self.repository, query, file_type)
         
         elif action == 'index':
+            # New behavior: check if file_name and file_size are provided (upload mode)
+            file_name = request.get('file_name')
             file_path = request.get('file_path', '')
-            return IndexCommand(self.repository, file_path)
+            
+            if file_name and file_content:
+                # Upload mode: file content provided
+                return IndexCommand(self.repository, file_path=None, 
+                                  file_name=file_name, file_content=file_content)
+            else:
+                # Old mode: file path provided
+                return IndexCommand(self.repository, file_path=file_path)
         
         elif action == 'download':
             file_id = request.get('file_id', '')
@@ -370,8 +423,16 @@ class SearchServer:
                 self._send_response(client_socket, error_response)
                 return
             
+            # Handle index action with file upload
+            file_content = None
+            if request.get('action') == 'index' and 'file_size' in request:
+                # Receive file content
+                file_size = request.get('file_size', 0)
+                self.logger.info(f"Receiving file content: {file_size} bytes")
+                file_content = self._receive_file_content(client_socket, file_size)
+            
             # Create and execute command
-            command = self.command_factory.create_command(request)
+            command = self.command_factory.create_command(request, file_content)
             
             if command is None:
                 error_response = {
@@ -447,6 +508,34 @@ class SearchServer:
         except Exception as e:
             self.logger.error(f"Error receiving data: {e}")
             return ''
+    
+    def _receive_file_content(self, client_socket: socket.socket, file_size: int, 
+                             buffer_size: int = 4096) -> bytes:
+        """
+        Receive file content from client socket
+        
+        Args:
+            client_socket: Client socket
+            file_size: Expected file size in bytes
+            buffer_size: Buffer size for receiving
+            
+        Returns:
+            File content as bytes
+        """
+        try:
+            self.logger.info(f"Receiving file content: {file_size} bytes")
+            data = b''
+            while len(data) < file_size:
+                chunk = client_socket.recv(min(buffer_size, file_size - len(data)))
+                if not chunk:
+                    break
+                data += chunk
+            
+            self.logger.info(f"Received {len(data)} bytes")
+            return data
+        except Exception as e:
+            self.logger.error(f"Error receiving file content: {e}")
+            return b''
     
     def _send_response(self, client_socket: socket.socket, response: Dict[str, Any]):
         """

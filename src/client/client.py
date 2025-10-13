@@ -69,6 +69,7 @@ class SearchClient:
     def index_file(self, file_path: str) -> bool:
         """
         Request server to index a file
+        Now sends file content to support Docker Swarm deployment
         
         Args:
             file_path: Path to file to index
@@ -77,17 +78,31 @@ class SearchClient:
             True if successful, False otherwise
         """
         try:
+            # Verify file exists locally
+            file_path_obj = Path(file_path)
+            if not file_path_obj.exists():
+                self.logger.error(f"File not found locally: {file_path}")
+                return False
+            
+            # Read file content
+            with open(file_path, 'rb') as f:
+                file_content = f.read()
+            
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.connect((self.server_host, self.server_port))
                 
-                # Create index request
+                # Create index request with file content
                 request = {
                     'action': 'index',
-                    'file_path': file_path
+                    'file_name': file_path_obj.name,
+                    'file_size': len(file_content)
                 }
                 
                 # Send request
                 self._send_request(sock, request)
+                
+                # Send file content
+                sock.sendall(file_content)
                 
                 # Receive response
                 response = self._receive_response(sock)
