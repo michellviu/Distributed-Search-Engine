@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  search-server:
+    image: search-engine:latest
+    ports:
+      - "5000:5000"
+    networks:
+      - search-network
+    deploy:
+      replicas: 2
+      placement:
+        max_replicas_per_node: 1
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+    volumes:
+      - shared_files:/app/shared_files
+      - logs:/app/logs
+
+networks:
+  search-network:
+    driver: overlay
+
+volumes:
+  shared_files:
+  logs:
