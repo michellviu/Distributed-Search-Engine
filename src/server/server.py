@@ -6,6 +6,7 @@ import socket
 import threading
 import logging
 import json
+import time
 from typing import Dict, List, Any, Optional
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -290,6 +291,75 @@ class CommandFactory:
             return None
 
 
+# ==================== Node Monitoring ====================
+
+class NodeMonitor:
+    """
+    Monitors the status of nodes in the distributed system
+    """
+    def __init__(self, nodes: list, check_interval: int = 5, timeout: int = 15):
+        """
+        Initialize the NodeMonitor
+
+        Args:
+            nodes: List of nodes to monitor (e.g., [(host, port), ...])
+            check_interval: Time interval (in seconds) between health checks
+            timeout: Time (in seconds) to consider a node as failed
+        """
+        self.nodes = nodes
+        self.check_interval = check_interval
+        self.timeout = timeout
+        self.node_status = {node: {'last_seen': time.time(), 'active': True} for node in nodes}
+        self.logger = logging.getLogger(__name__)
+        self.lock = threading.Lock()
+
+    def start_monitoring(self):
+        """
+        Start monitoring nodes in a separate thread
+        """
+        threading.Thread(target=self._monitor_nodes, daemon=True).start()
+        self.logger.info("Node monitoring started")
+
+    def _monitor_nodes(self):
+        """
+        Periodically check the status of nodes
+        """
+        while True:
+            time.sleep(self.check_interval)
+            with self.lock:
+                for node, status in self.node_status.items():
+                    if time.time() - status['last_seen'] > self.timeout:
+                        if status['active']:
+                            self.logger.warning(f"Node {node} is unresponsive. Marking as failed.")
+                            status['active'] = False
+                            self._reassign_tasks(node)
+
+    def update_heartbeat(self, node):
+        """
+        Update the heartbeat for a node
+
+        Args:
+            node: The node that sent a heartbeat
+        """
+        with self.lock:
+            if node in self.node_status:
+                self.node_status[node]['last_seen'] = time.time()
+                if not self.node_status[node]['active']:
+                    self.logger.info(f"Node {node} is back online.")
+                    self.node_status[node]['active'] = True
+
+    def _reassign_tasks(self, failed_node):
+        """
+        Reassign tasks from a failed node to other nodes
+
+        Args:
+            failed_node: The node that failed
+        """
+        self.logger.info(f"Reassigning tasks from failed node {failed_node}.")
+        # Implement task reassignment logic here
+        # For example, consult logs or a central task queue
+
+
 # ==================== Server Implementation ====================
 
 class SearchServer:
@@ -299,7 +369,7 @@ class SearchServer:
     """
     
     def __init__(self, host: str = 'localhost', port: int = 5000, 
-                 repository: DocumentRepository = None, file_transfer=None):
+                 repository: DocumentRepository = None, file_transfer=None, nodes: list = None):
         """
         Initialize the search server
         
@@ -308,6 +378,7 @@ class SearchServer:
             port: Server port number
             repository: Document repository implementation
             file_transfer: File transfer handler
+            nodes: List of nodes for distributed monitoring
         """
         self.host = host
         self.port = port
@@ -316,10 +387,14 @@ class SearchServer:
         self.repository = repository
         self.file_transfer = file_transfer
         self.command_factory = CommandFactory(repository, file_transfer)
+        self.nodes = nodes or []
+        self.node_monitor = NodeMonitor(self.nodes)
         self.logger = logging.getLogger(__name__)
         
     def start(self):
         """Start the server and begin listening for connections"""
+        self.node_monitor.start_monitoring()
+        
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.socket.bind((self.host, self.port))
@@ -384,6 +459,10 @@ class SearchServer:
             # Execute command
             response = command.execute()
             
+            # Update heartbeat if the client is a known node
+            if address in self.nodes:
+                self.node_monitor.update_heartbeat(address)
+
             # Handle download special case (needs to send file)
             if request.get('action') == 'download' and response.get('status') == 'success':
                 self._send_response(client_socket, response)
@@ -475,3 +554,12 @@ class SearchServer:
         if self.socket:
             self.socket.close()
         self.logger.info("Server stopped")
+
+
+# Example initialization
+if __name__ == "__main__":
+    nodes = [("127.0.0.1", 5001), ("127.0.0.1", 5002)]  # Example nodes
+    repository = InMemoryDocumentRepository(None, None)  # Replace with actual implementations
+    file_transfer = None  # Replace with actual file transfer implementation
+    server = SearchServer(host="127.0.0.1", port=5000, repository=repository, file_transfer=file_transfer, nodes=nodes)
+    server.start()
