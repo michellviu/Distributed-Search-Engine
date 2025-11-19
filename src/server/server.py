@@ -290,6 +290,21 @@ class ListCommand(Command):
             }
 
 
+class HealthCommand(Command):
+    """Command for checking server health"""
+    
+    def __init__(self):
+        pass
+    
+    def execute(self) -> Dict[str, Any]:
+        """Return health status"""
+        return {
+            'status': 'ok',
+            'action': 'health',
+            'message': 'Server is running'
+        }
+
+
 # ==================== Command Factory ====================
 
 class CommandFactory:
@@ -337,6 +352,9 @@ class CommandFactory:
         
         elif action == 'list':
             return ListCommand(self.repository)
+            
+        elif action == 'health':
+            return HealthCommand()
         
         else:
             self.logger.warning(f"Unknown action: {action}")
@@ -352,7 +370,8 @@ class SearchServer:
     """
     
     def __init__(self, host: str = 'localhost', port: int = 5000, 
-                 repository: DocumentRepository = None, file_transfer=None):
+                 repository: DocumentRepository = None, file_transfer=None,
+                 node_id: str = None, discovery=None):
         """
         Initialize the search server
         
@@ -361,6 +380,8 @@ class SearchServer:
             port: Server port number
             repository: Document repository implementation
             file_transfer: File transfer handler
+            node_id: ID of the node (for distributed mode)
+            discovery: Node discovery service (for distributed mode)
         """
         self.host = host
         self.port = port
@@ -368,6 +389,8 @@ class SearchServer:
         self.running = False
         self.repository = repository
         self.file_transfer = file_transfer
+        self.node_id = node_id
+        self.discovery = discovery
         self.command_factory = CommandFactory(repository, file_transfer)
         self.logger = logging.getLogger(__name__)
         
