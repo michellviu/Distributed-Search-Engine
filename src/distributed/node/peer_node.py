@@ -1,5 +1,7 @@
 import sys
 from pathlib import Path
+
+from src.distributed.replication.replication_manager import ReplicationManager
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from server.server import SearchServer, InMemoryDocumentRepository
@@ -32,14 +34,16 @@ class PeerNode:
         repository = InMemoryDocumentRepository(indexer, search_engine)
         
         self.discovery = NodeDiscovery(node_id, 'peer', host, port)
-  
+        self.replication_manager = ReplicationManager(self.discovery, node_id)
+
         self.server = SearchServer(
             host, 
             port, 
             repository, 
             file_transfer, 
             node_id=node_id,
-            discovery=self.discovery
+            discovery=self.discovery,
+            replication_manager=self.replication_manager
         )
         
         self.heartbeat = HeartbeatMonitor()
@@ -74,6 +78,7 @@ class PeerNode:
     def _on_node_recovered(self, node_id: str, node_info: dict):
         """Callback: Un nodo se recuperó"""
         self.logger.info(f"Nodo recuperado: {node_id}")
+        threading.Thread(target=self.replication_manager.check_redundancy()).start()
         
         
     def start(self):
@@ -98,6 +103,9 @@ class PeerNode:
         # 🆕 Esperar 5 segundos para descubrir nodos
         self.logger.info("🔍 Descubriendo nodos en la red...")
         threading.Event().wait(5)
+
+        self.logger.info("🔄 Sincronizando datos con el cluster...")
+        threading.Thread(target=self.replication_manager.check_redundancy).start()
         
         try:
             while self.active:

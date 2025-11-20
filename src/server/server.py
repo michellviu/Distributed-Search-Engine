@@ -132,11 +132,13 @@ class IndexCommand(Command):
     """Command for indexing a new document"""
     
     def __init__(self, repository: DocumentRepository, file_path: str = None, 
-                 file_name: str = None, file_content: bytes = None):
+                 file_name: str = None, file_content: bytes = None,
+                 replication_manager=None):
         self.repository = repository
         self.file_path = file_path  # For backward compatibility
         self.file_name = file_name  # New: file name from client
         self.file_content = file_content  # New: file content from client
+        self.replication_manager = replication_manager
         self.logger = logging.getLogger(__name__)
     
     def execute(self) -> Dict[str, Any]:
@@ -160,6 +162,15 @@ class IndexCommand(Command):
                 success = self.repository.index_file(str(target_path))
                 
                 if success:
+
+                    if self.replication_manager:
+                        self.logger.info("Iniciando replicación distribuida...")
+                        # Ejecutar en background para no bloquear respuesta al cliente
+                        threading.Thread(
+                            target=self.replication_manager.replicate_file,
+                            args=(self.file_name, self.file_content)
+                        ).start()
+
                     return {
                         'status': 'success',
                         'action': 'index',
@@ -303,6 +314,40 @@ class HealthCommand(Command):
             'action': 'health',
             'message': 'Server is running'
         }
+    
+
+class ReplicateCommand(Command):
+    """Comando para recibir una réplica desde otro nodo (no dispara nueva replicación)"""
+    
+    def __init__(self, repository: DocumentRepository, file_name: str, file_content: bytes):
+        self.repository = repository
+        self.file_name = file_name
+        self.file_content = file_content
+        self.logger = logging.getLogger(__name__)
+        
+    def execute(self) -> Dict[str, Any]:
+        try:
+            self.logger.info(f"Recibiendo réplica: {self.file_name}")
+            
+            # Guardar archivo
+            shared_files_dir = Path('shared_files')
+            shared_files_dir.mkdir(exist_ok=True)
+            target_path = shared_files_dir / self.file_name
+            
+            with open(target_path, 'wb') as f:
+                f.write(self.file_content)
+                
+            # Indexar localmente
+            success = self.repository.index_file(str(target_path))
+            
+            return {
+                'status': 'success' if success else 'error',
+                'action': 'replicate',
+                'message': 'Replica stored'
+            }
+        except Exception as e:
+            self.logger.error(f"Error guardando réplica: {e}")
+            return {'status': 'error', 'message': str(e)}
 
 
 # ==================== Command Factory ====================
@@ -356,6 +401,12 @@ class CommandFactory:
         elif action == 'health':
             return HealthCommand()
         
+        elif action == 'replicate':
+            file_name = request.get('file_name')
+            if file_name and file_content:
+                return ReplicateCommand(self.repository, file_name, file_content)
+            return None
+        
         else:
             self.logger.warning(f"Unknown action: {action}")
             return None
@@ -371,7 +422,7 @@ class SearchServer:
     
     def __init__(self, host: str = 'localhost', port: int = 5000, 
                  repository: DocumentRepository = None, file_transfer=None,
-                 node_id: str = None, discovery=None):
+                 node_id: str = None, discovery=None, replication_manager=None):
         """
         Initialize the search server
         
@@ -391,7 +442,8 @@ class SearchServer:
         self.file_transfer = file_transfer
         self.node_id = node_id
         self.discovery = discovery
-        self.command_factory = CommandFactory(repository, file_transfer)
+        self.replication_manager = replication_manager
+        self.command_factory = CommandFactory(repository, file_transfer, replication_manager)
         self.logger = logging.getLogger(__name__)
         
     def start(self):
@@ -448,7 +500,7 @@ class SearchServer:
             
             # Handle index action with file upload
             file_content = None
-            if request.get('action') == 'index' and 'file_size' in request:
+            if request.get('action') in ['index', 'replicate'] and 'file_size' in request:
                 # Receive file content
                 file_size = request.get('file_size', 0)
                 self.logger.info(f"Receiving file content: {file_size} bytes")
