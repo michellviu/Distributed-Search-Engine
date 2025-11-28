@@ -68,23 +68,35 @@ class LeaderElection:
             
         # Enviar mensaje ELECTION a nodos superiores
         responses_received = False
-        for node in higher_nodes:
+        threads = []
+        results = []
+
+        def ask_node(node):
             try:
-                response = self._send_election_message(node)
-                if response and response.get('status') == 'ok':
-                    responses_received = True
+                resp = self._send_election_message(node)
+                if resp and resp.get('status') == 'ok':
+                    results.append(True)
                     self.logger.info(f"Nodo {node.node_id} respondió a elección")
-            except Exception as e:
-                self.logger.debug(f"Nodo {node.node_id} no respondió: {e}")
-                
-        if not responses_received:
-            # Ningún nodo superior respondió, somos el líder
-            self._become_leader()
-        else:
+            except Exception:
+                pass
+
+        for node in higher_nodes:
+            t = threading.Thread(target=ask_node, args=(node,))
+            t.start()
+            threads.append(t)
+
+        # Esperar a que terminen (máximo el tiempo del timeout del socket)
+        for t in threads:
+            t.join()
+
+        if any(results):
             # Esperar a que un nodo superior se declare líder
             self.role = NodeRole.FOLLOWER
             with self._lock:
                 self.election_in_progress = False
+        else:
+            # Ningún nodo superior respondió, somos el líder
+            self._become_leader()
                 
     def _become_leader(self):
         """Convertirse en el coordinador del cluster"""

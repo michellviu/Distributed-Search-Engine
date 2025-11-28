@@ -43,7 +43,8 @@ Cada nodo del sistema (`search-node`) ejecuta un proceso principal en Python (`m
 * **Main Thread:** Inicia el servidor y la lógica principal.
 * **TCP Server Thread:** Un servidor `ThreadingTCPServer` que genera un hilo nuevo por cada conexión de cliente o nodo entrante para manejar comandos (RPC simulado).
 * **Heartbeat Monitor Thread:** Un hilo en segundo plano (`HeartbeatMonitor`) que envía y verifica señales de vida de otros nodos.
-* **Discovery Listener Thread:** Un hilo dedicado a escuchar mensajes UDP Multicast para el descubrimiento automático de nuevos nodos.
+* **Discovery Thread:** Un hilo dedicado al descubrimiento de nodos mediante escaneo de subred TCP y conexión periódica a peers conocidos.
+* **Subnet Scanner Thread:** Escanea la subred local en paralelo buscando nodos activos en el puerto 5000.
 
 ### Patrón de Diseño
 
@@ -55,10 +56,11 @@ Se utiliza el patrón **Reactor/Event-Driven** para la red (a través de `socket
 
 ### Tipo de Comunicación
 
-La comunicación es híbrida, optimizada según el propósito:
+La comunicación es **100% TCP**, optimizada para fiabilidad y compatibilidad con Docker:
 
 1. **TCP (Sockets):** Para operaciones críticas que requieren fiabilidad (Indexar, Buscar, Replicar, Votar en elección). Se utiliza un protocolo de mensajes basado en **JSON**.
-2. **UDP (Multicast/Unicast):** Para operaciones ligeras y de descubrimiento (Ping, Heartbeat, Discovery).
+2. **TCP (IP Cache Discovery):** Para descubrimiento automático de nodos mediante escaneo de subred y registro bidireccional.
+3. **TCP (Health Check):** Para verificar la salud de los nodos (heartbeat).
 
 ### Comunicación Cliente-Servidor
 
@@ -114,7 +116,12 @@ Para localizar dónde debe guardarse o buscarse un dato, se utiliza un **Anillo 
 
 ### Descubrimiento
 
-Se utiliza **UDP Multicast** (o Seed Nodes en configuración manual). Un nodo nuevo envía un mensaje "HELLO" a la dirección multicast. Los nodos existentes responden con su información, permitiendo al nuevo nodo construir su tabla de enrutamiento local.
+Se utiliza **IP Cache Discovery**
+
+1. **Escaneo de Subred:** Al iniciar, cada nodo escanea la subred local (ej. `10.0.1.0/24`) buscando otros nodos en el puerto 5000.
+2. **Registro Bidireccional:** Cuando un nodo A contacta a un nodo B para obtener peers (`get_peers`), A envía su propia información. B registra a A automáticamente, creando un registro mutuo.
+3. **Propagación de Peers:** Cuando B responde a A, incluye la lista de todos los nodos que conoce. A registra esos nodos y puede contactarlos directamente.
+4. **Seed Nodes (Opcional):** Como respaldo, se pueden configurar nodos conocidos de antemano para acelerar el descubrimiento inicial.
 
 ---
 

@@ -1,3 +1,3 @@
 # Discovery components
-from .node_discovery import NodeDiscovery, NodeInfo
+from .ip_cache_discovery import IPCacheDiscovery, NodeInfo
 from .heartbeat import HeartbeatMonitor

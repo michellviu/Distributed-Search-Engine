@@ -442,11 +442,29 @@ class ClusterStatusCommand(Command):
 class GetPeersCommand(Command):
     """Comando para obtener lista de peers conocidos (para discovery)"""
     
-    def __init__(self, discovery, node_id: str):
+    def __init__(self, discovery, node_id: str, from_node: str = None,
+                 from_host: str = None, from_port: int = None, from_type: str = 'peer'):
         self.discovery = discovery
         self.node_id = node_id
+        self.from_node = from_node
+        self.from_host = from_host
+        self.from_port = from_port
+        self.from_type = from_type
+        self.logger = logging.getLogger(__name__)
         
     def execute(self) -> Dict[str, Any]:
+        # REGISTRO BIDIRECCIONAL: Registrar al nodo que nos contactó
+        if self.discovery and self.from_node and self.from_host and self.from_port:
+            self.logger.info(f"📥 Registrando nodo via IP Cache: {self.from_node} ({self.from_host}:{self.from_port})")
+            # Usar el método específico para registro desde conexión
+            if hasattr(self.discovery, 'register_node_from_connection'):
+                self.discovery.register_node_from_connection(
+                    node_id=self.from_node,
+                    host=self.from_host,
+                    port=self.from_port,
+                    node_type=self.from_type
+                )
+        
         peers = []
         if self.discovery:
             for node in self.discovery.get_active_nodes():
@@ -596,7 +614,15 @@ class CommandFactory:
         
         elif action == 'get_peers':
             # Obtener lista de peers conocidos (para discovery)
-            return GetPeersCommand(self.discovery, self.node_id)
+            # Incluye registro bidireccional via IP Cache
+            return GetPeersCommand(
+                self.discovery, 
+                self.node_id,
+                from_node=request.get('from_node'),
+                from_host=request.get('from_host'),
+                from_port=request.get('from_port'),
+                from_type=request.get('from_type', 'peer')
+            )
         
         elif action == 'distributed_search':
             # Búsqueda distribuida en todo el cluster

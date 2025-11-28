@@ -14,7 +14,7 @@ from server.server import SearchServer, InMemoryDocumentRepository
 from indexer.indexer import DocumentIndexer
 from search.search_engine import SearchEngine
 from transfer.file_transfer import FileTransfer
-from distributed.discovery.multicast_discovery import MulticastDiscovery, NodeInfo
+from distributed.discovery.ip_cache_discovery import IPCacheDiscovery, NodeInfo
 from distributed.discovery.heartbeat import HeartbeatMonitor
 from distributed.replication.replication_manager import ReplicationManager
 from distributed.coordination.coordinator import LeaderElection, LoadBalancer
@@ -56,9 +56,9 @@ class PeerNode:
         
         # === Componentes Distribuidos ===
         
-        # 1. Descubrimiento de nodos (usando Multicast + seed nodes)
+        # 1. Descubrimiento de nodos (usando IP Cache + seed nodes)
         # Usamos announce_host para que otros nodos sepan dónde conectarse
-        self.discovery = MulticastDiscovery(
+        self.discovery = IPCacheDiscovery(
             node_id=node_id, 
             node_type='peer', 
             host=self.announce_host,  # IP para anunciarse
