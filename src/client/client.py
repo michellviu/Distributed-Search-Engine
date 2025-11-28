@@ -5,25 +5,43 @@ Client implementation for search requests
 import socket
 import logging
 import json
+import os
 from typing import List, Dict, Optional
 from pathlib import Path
 
 
+def get_server_address():
+    """
+    Obtiene la dirección del servidor desde variables de entorno.
+    Esto permite que el cliente sea transparente al sistema distribuido.
+    
+    En Docker Swarm, el cliente se conecta al load balancer o al DNS del servicio.
+    El sistema distribuido es completamente transparente para el cliente.
+    """
+    host = os.environ.get('SEARCH_SERVER_HOST', 'localhost')
+    port = int(os.environ.get('SEARCH_SERVER_PORT', '5000'))
+    return host, port
+
+
 class SearchClient:
     """
-    Client for connecting to centralized search server
+    Client for connecting to search server.
+    
+    El cliente es agnóstico al sistema distribuido - simplemente se conecta
+    a un endpoint (que puede ser un load balancer o un nodo directo).
     """
     
-    def __init__(self, server_host: str = 'localhost', server_port: int = 5000):
+    def __init__(self, server_host: str = None, server_port: int = None):
         """
         Initialize the search client
         
         Args:
-            server_host: Server host address
-            server_port: Server port number
+            server_host: Server host address (default: from env SEARCH_SERVER_HOST or 'localhost')
+            server_port: Server port number (default: from env SEARCH_SERVER_PORT or 5000)
         """
-        self.server_host = server_host
-        self.server_port = server_port
+        default_host, default_port = get_server_address()
+        self.server_host = server_host or default_host
+        self.server_port = server_port or default_port
         self.logger = logging.getLogger(__name__)
         
     def search(self, query: str, file_type: Optional[str] = None) -> List[Dict]:

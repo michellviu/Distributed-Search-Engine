@@ -129,60 +129,139 @@ class SearchCommand(Command):
 
 
 class IndexCommand(Command):
-    """Command for indexing a new document"""
+    """
+    Command for indexing a new document.
+    
+    Cuando se sube un archivo:
+    1. Lo guarda temporalmente
+    2. Usa Quorum para replicar con garantía de consistencia
+    3. Solo lo mantiene localmente si este nodo es responsable
+    """
     
     def __init__(self, repository: DocumentRepository, file_path: str = None, 
                  file_name: str = None, file_content: bytes = None,
-                 replication_manager=None):
+                 replication_manager=None, node_id: str = None,
+                 quorum_manager=None, consistency: str = 'QUORUM'):
         self.repository = repository
-        self.file_path = file_path  # For backward compatibility
-        self.file_name = file_name  # New: file name from client
-        self.file_content = file_content  # New: file content from client
+        self.file_path = file_path
+        self.file_name = file_name
+        self.file_content = file_content
         self.replication_manager = replication_manager
+        self.node_id = node_id
+        self.quorum_manager = quorum_manager
+        self.consistency = consistency
         self.logger = logging.getLogger(__name__)
+    
+    def _is_responsible_for_file(self, file_name: str) -> bool:
+        """Verifica si este nodo debe almacenar el archivo según hash ring."""
+        if not self.replication_manager or not self.node_id:
+            return True  # Sin replication manager, asumir que sí
+        
+        self.replication_manager._update_ring()
+        target_nodes = self.replication_manager.hash_ring.get_nodes_for_replication(
+            file_name, self.replication_manager.REPLICATION_FACTOR
+        )
+        
+        # Normalizar node_id para comparación
+        my_normalized = self.replication_manager._normalize_node_id(self.node_id)
+        
+        for target in target_nodes:
+            target_normalized = self.replication_manager._normalize_node_id(target)
+            if my_normalized == target_normalized:
+                return True
+        
+        return False
+    
+    def _get_consistency_level(self):
+        """Obtiene el nivel de consistencia del QuorumManager"""
+        if self.quorum_manager:
+            # Import relativo para compatibilidad con Docker
+            try:
+                from src.distributed.contistency.quorum import ConsistencyLevel
+            except ImportError:
+                from distributed.contistency.quorum import ConsistencyLevel
+            levels = {
+                'ONE': ConsistencyLevel.ONE,
+                'QUORUM': ConsistencyLevel.QUORUM,
+                'ALL': ConsistencyLevel.ALL
+            }
+            return levels.get(self.consistency.upper(), ConsistencyLevel.QUORUM)
+        return None
     
     def execute(self) -> Dict[str, Any]:
         """Execute indexing and return result"""
         try:
             # New behavior: If file content is provided, save it first
             if self.file_content is not None and self.file_name:
-                self.logger.info(f"Executing index with uploaded content: file='{self.file_name}'")
+                self.logger.info(f"📤 Recibiendo archivo: '{self.file_name}'")
                 
-                # Save file to shared_files directory
                 shared_files_dir = Path('shared_files')
                 shared_files_dir.mkdir(exist_ok=True)
-                
                 target_path = shared_files_dir / self.file_name
-                with open(target_path, 'wb') as f:
-                    f.write(self.file_content)
                 
-                self.logger.info(f"File saved to: {target_path}")
+                # Verificar si este nodo es responsable de este archivo
+                is_responsible = self._is_responsible_for_file(self.file_name)
                 
-                # Index the saved file
-                success = self.repository.index_file(str(target_path))
-                
-                if success:
-
-                    if self.replication_manager:
-                        self.logger.info("Iniciando replicación distribuida...")
-                        # Ejecutar en background para no bloquear respuesta al cliente
-                        threading.Thread(
-                            target=self.replication_manager.replicate_file,
-                            args=(self.file_name, self.file_content)
-                        ).start()
-
-                    return {
-                        'status': 'success',
-                        'action': 'index',
-                        'file_path': str(target_path),
-                        'message': 'File uploaded and indexed successfully'
-                    }
+                if is_responsible:
+                    # Guardar y indexar localmente
+                    with open(target_path, 'wb') as f:
+                        f.write(self.file_content)
+                    self.repository.index_file(str(target_path))
+                    self.logger.info(f"✅ Archivo guardado (nos corresponde): {self.file_name}")
                 else:
-                    return {
-                        'status': 'error',
-                        'action': 'index',
-                        'message': 'File uploaded but indexing failed'
-                    }
+                    self.logger.info(f"⏭️ Archivo no nos corresponde, solo replicando: {self.file_name}")
+                
+                # Usar Quorum si está disponible, sino replicación directa
+                if self.quorum_manager and self.replication_manager:
+                    consistency_level = self._get_consistency_level()
+                    self.logger.info(f"🔐 Usando QUORUM para replicación (consistencia: {self.consistency})")
+                    
+                    # Obtener nodos objetivo del hash ring
+                    self.replication_manager._update_ring()
+                    target_nodes = self.replication_manager.hash_ring.get_nodes_for_replication(
+                        self.file_name, self.replication_manager.REPLICATION_FACTOR
+                    )
+                    
+                    # Mapear node_ids a NodeInfo
+                    nodes_to_replicate = []
+                    for node in self.replication_manager.discovery.get_active_nodes():
+                        node_normalized = self.replication_manager._normalize_node_id(node.node_id)
+                        for target in target_nodes:
+                            target_normalized = self.replication_manager._normalize_node_id(target)
+                            if node_normalized == target_normalized:
+                                nodes_to_replicate.append(node)
+                                break
+                    
+                    def quorum_replicate():
+                        result = self.quorum_manager.write_with_quorum(
+                            self.file_name,
+                            self.file_content,
+                            consistency_level,
+                            nodes_to_replicate
+                        )
+                        if result.success:
+                            self.logger.info(f"✅ Quorum write exitoso: {result.nodes_succeeded}/{result.total_nodes} nodos")
+                        else:
+                            self.logger.warning(f"⚠️ Quorum write parcial: {result.nodes_succeeded}/{result.total_nodes} nodos")
+                    
+                    threading.Thread(target=quorum_replicate).start()
+                    
+                elif self.replication_manager:
+                    self.logger.info("🔄 Iniciando replicación distribuida (sin Quorum)...")
+                    threading.Thread(
+                        target=self.replication_manager.replicate_file,
+                        args=(self.file_name, self.file_content)
+                    ).start()
+
+                return {
+                    'status': 'success',
+                    'action': 'index',
+                    'file_path': str(target_path) if is_responsible else None,
+                    'stored_locally': is_responsible,
+                    'quorum_enabled': self.quorum_manager is not None,
+                    'consistency': self.consistency,
+                    'message': 'File uploaded and being replicated with quorum consistency' if self.quorum_manager else 'File uploaded and being replicated'
+                }
             
             # Old behavior: file_path provided (for backward compatibility)
             elif self.file_path:
@@ -317,17 +396,45 @@ class HealthCommand(Command):
     
 
 class ReplicateCommand(Command):
-    """Comando para recibir una réplica desde otro nodo (no dispara nueva replicación)"""
+    """
+    Comando para recibir una réplica desde otro nodo.
     
-    def __init__(self, repository: DocumentRepository, file_name: str, file_content: bytes):
+    Verifica que este nodo sea responsable del archivo según el hash ring
+    antes de almacenarlo. Esto garantiza que cada archivo solo esté en
+    los nodos que le corresponden (REPLICATION_FACTOR nodos).
+    
+    Si is_quorum_write=True, se salta la verificación de hash ring porque
+    el QuorumManager ya determinó que este nodo debe recibir el archivo.
+    """
+    
+    def __init__(self, repository: DocumentRepository, file_name: str, 
+                 file_content: bytes, replication_manager=None, node_id: str = None,
+                 is_quorum_write: bool = False):
         self.repository = repository
         self.file_name = file_name
         self.file_content = file_content
+        self.replication_manager = replication_manager
+        self.node_id = node_id
+        self.is_quorum_write = is_quorum_write
         self.logger = logging.getLogger(__name__)
         
     def execute(self) -> Dict[str, Any]:
         try:
-            self.logger.info(f"Recibiendo réplica: {self.file_name}")
+            # Si es una escritura Quorum, confiar en que el QuorumManager ya validó
+            if self.is_quorum_write:
+                self.logger.info(f"📥 Recibiendo réplica QUORUM: {self.file_name}")
+            elif self.replication_manager and self.node_id:
+                # Verificar si este nodo debe almacenar el archivo según el hash ring
+                if not self._should_store_file():
+                    self.logger.info(f"⏭️ Rechazando réplica {self.file_name} - no nos corresponde")
+                    return {
+                        'status': 'rejected',
+                        'action': 'replicate',
+                        'message': 'Node not responsible for this file',
+                        'reason': 'hash_ring_mismatch'
+                    }
+            
+            self.logger.info(f"📥 Recibiendo réplica: {self.file_name}")
             
             # Guardar archivo
             shared_files_dir = Path('shared_files')
@@ -343,11 +450,33 @@ class ReplicateCommand(Command):
             return {
                 'status': 'success' if success else 'error',
                 'action': 'replicate',
-                'message': 'Replica stored'
+                'quorum_write': self.is_quorum_write,
+                'message': 'Replica stored via Quorum' if self.is_quorum_write else 'Replica stored',
+                'timestamp': __import__('time').time()
             }
         except Exception as e:
             self.logger.error(f"Error guardando réplica: {e}")
             return {'status': 'error', 'message': str(e)}
+    
+    def _should_store_file(self) -> bool:
+        """
+        Verifica si este nodo debe almacenar el archivo según el hash ring.
+        """
+        self.replication_manager._update_ring()
+        
+        target_nodes = self.replication_manager.hash_ring.get_nodes_for_replication(
+            self.file_name, 
+            self.replication_manager.REPLICATION_FACTOR
+        )
+        
+        # Verificar si nuestro node_id está en la lista de nodos responsables
+        our_ids = [self.node_id, f"node_{self.node_id}"]
+        
+        for target in target_nodes:
+            if target in our_ids or self.node_id in target:
+                return True
+        
+        return False
 
 
 # ==================== Distributed Commands ====================
@@ -516,7 +645,7 @@ class CommandFactory:
     
     def __init__(self, repository: DocumentRepository, file_transfer=None, 
                  replication_manager=None, distributed_search=None, election=None,
-                 node_id: str = None, discovery=None):
+                 node_id: str = None, discovery=None, quorum_manager=None):
         self.repository = repository
         self.file_transfer = file_transfer
         self.replication_manager = replication_manager
@@ -524,6 +653,7 @@ class CommandFactory:
         self.election = election
         self.node_id = node_id
         self.discovery = discovery
+        self.quorum_manager = quorum_manager
         self.logger = logging.getLogger(__name__)
     
     def create_command(self, request: Dict[str, Any], file_content: bytes = None) -> Optional[Command]:
@@ -551,16 +681,23 @@ class CommandFactory:
             # New behavior: check if file_name and file_size are provided (upload mode)
             file_name = request.get('file_name')
             file_path = request.get('file_path', '')
+            consistency = request.get('consistency', 'QUORUM')  # Nivel de consistencia
             
             if file_name and file_content:
                 # Upload mode: file content provided
                 return IndexCommand(self.repository, file_path=None, 
                                   file_name=file_name, file_content=file_content,
-                                  replication_manager=self.replication_manager)
+                                  replication_manager=self.replication_manager,
+                                  node_id=self.node_id,
+                                  quorum_manager=self.quorum_manager,
+                                  consistency=consistency)
             else:
                 # Old mode: file path provided
                 return IndexCommand(self.repository, file_path=file_path,
-                                  replication_manager=self.replication_manager)
+                                  replication_manager=self.replication_manager,
+                                  node_id=self.node_id,
+                                  quorum_manager=self.quorum_manager,
+                                  consistency=consistency)
         
         elif action == 'download':
             file_id = request.get('file_id', '')
@@ -574,8 +711,16 @@ class CommandFactory:
         
         elif action == 'replicate':
             file_name = request.get('file_name')
+            is_quorum_write = request.get('is_quorum_write', False)  # Si viene de Quorum
             if file_name and file_content:
-                return ReplicateCommand(self.repository, file_name, file_content)
+                return ReplicateCommand(
+                    self.repository, 
+                    file_name, 
+                    file_content,
+                    replication_manager=self.replication_manager,
+                    node_id=self.node_id,
+                    is_quorum_write=is_quorum_write
+                )
             return None
         
         # === Comandos Distribuidos ===
@@ -645,7 +790,8 @@ class SearchServer:
     
     def __init__(self, host: str = 'localhost', port: int = 5000, 
                  repository: DocumentRepository = None, file_transfer=None,
-                 node_id: str = None, discovery=None, replication_manager=None):
+                 node_id: str = None, discovery=None, replication_manager=None,
+                 quorum_manager=None):
         """
         Initialize the search server
         
@@ -656,6 +802,8 @@ class SearchServer:
             file_transfer: File transfer handler
             node_id: ID of the node (for distributed mode)
             discovery: Node discovery service (for distributed mode)
+            replication_manager: Manager for file replication
+            quorum_manager: Manager for quorum consistency
         """
         self.host = host
         self.port = port
@@ -666,6 +814,7 @@ class SearchServer:
         self.node_id = node_id
         self.discovery = discovery
         self.replication_manager = replication_manager
+        self.quorum_manager = quorum_manager
         self.election = None  # Set later if distributed
         self.distributed_search = None  # Set later if distributed
         self.command_factory = None  # Initialize after all components are set
@@ -681,7 +830,8 @@ class SearchServer:
             self.distributed_search,
             self.election,
             self.node_id,
-            self.discovery
+            self.discovery,
+            self.quorum_manager
         )
     
     def set_distributed_components(self, election=None, distributed_search=None):

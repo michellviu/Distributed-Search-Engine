@@ -68,17 +68,34 @@ class DocumentIndexer:
                 'hash': file_hash
             }
             
-            # Index by file name
+            # Initialize index for this file name if needed
             if file_name not in self.index:
                 self.index[file_name] = []
-            self.index[file_name].append(file_info)
             
-            # Track duplicates by hash
+            # Check if file already exists in index (by path or hash)
+            existing_paths = [f['path'] for f in self.index[file_name]]
+            existing_hashes = [f['hash'] for f in self.index[file_name]]
+            
+            if file_path in existing_paths:
+                # Update existing entry instead of adding duplicate
+                for i, f in enumerate(self.index[file_name]):
+                    if f['path'] == file_path:
+                        self.index[file_name][i] = file_info
+                        break
+                self.logger.debug(f"Updated existing file in index: {file_path}")
+            elif file_hash in existing_hashes:
+                # Same content, different path - skip (it's a duplicate)
+                self.logger.debug(f"Skipped duplicate file (same hash): {file_path}")
+                return  # Don't re-index duplicates
+            else:
+                # New file, add to index
+                self.index[file_name].append(file_info)
+                self.logger.debug(f"Indexed new file: {file_path}")
+            
+            # Track by hash
             if file_hash not in self.file_hashes:
                 self.file_hashes[file_hash] = set()
             self.file_hashes[file_hash].add(file_path)
-            
-            self.logger.debug(f"Indexed file: {file_path}")
             
         except Exception as e:
             self.logger.error(f"Error indexing file {file_path}: {e}")

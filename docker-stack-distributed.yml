@@ -1,0 +1,96 @@
+version: '3.8'
+
+
+services:
+  # Nodo 1 - Primer nodo del cluster (seed node)
+  node1:
+    image: search-engine-distributed:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.distributed
+    container_name: search-node1
+    hostname: node1
+    networks:
+      - search-net
+    environment:
+      - NODE_ID=node1
+      - NODE_PORT=5000
+      - INDEX_PATH=/app/shared_files
+      # Primer nodo, no necesita seeds
+      - SEED_NODES=
+    volumes:
+      - node1_files:/app/shared_files
+      - node1_logs:/app/logs
+    ports:
+      - "5000:5000"      # Puerto TCP principal
+      - "5007:5007/udp"  # Puerto UDP Multicast
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.socket(); s.settimeout(2); s.connect(('localhost',5000)); s.close()"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # Nodo 2 - Se conecta al nodo 1
+  node2:
+    image: search-engine-distributed:latest
+    container_name: search-node2
+    hostname: node2
+    networks:
+      - search-net
+    environment:
+      - NODE_ID=node2
+      - NODE_PORT=5000
+      - INDEX_PATH=/app/shared_files
+      # Seed: conectar al nodo 1
+      - SEED_NODES=node1:5000
+    volumes:
+      - node2_files:/app/shared_files
+      - node2_logs:/app/logs
+    ports:
+      - "5001:5000"      # Puerto TCP (diferente en host)
+      - "5008:5007/udp"  # Puerto UDP
+    depends_on:
+      - node1
+    restart: unless-stopped
+
+  # Nodo 3 - Se conecta al nodo 1
+  node3:
+    image: search-engine-distributed:latest
+    container_name: search-node3
+    hostname: node3
+    networks:
+      - search-net
+    environment:
+      - NODE_ID=node3
+      - NODE_PORT=5000
+      - INDEX_PATH=/app/shared_files
+      # Seed: conectar al nodo 1
+      - SEED_NODES=node1:5000
+    volumes:
+      - node3_files:/app/shared_files
+      - node3_logs:/app/logs
+    ports:
+      - "5002:5000"      # Puerto TCP
+      - "5009:5007/udp"  # Puerto UDP
+    depends_on:
+      - node1
+    restart: unless-stopped
+
+networks:
+  search-net:
+    driver: overlay
+    attachable: true
+    # Permitir multicast
+    ipam:
+      config:
+        - subnet: 10.10.0.0/24
+
+volumes:
+  node1_files:
+  node1_logs:
+  node2_files:
+  node2_logs:
+  node3_files:
+  node3_logs:

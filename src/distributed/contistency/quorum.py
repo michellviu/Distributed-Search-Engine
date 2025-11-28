@@ -24,6 +24,14 @@ class WriteResult:
     acks_received: int
     acks_required: int
     failed_nodes: List[str]
+    
+    @property
+    def nodes_succeeded(self) -> int:
+        return self.acks_received
+    
+    @property
+    def total_nodes(self) -> int:
+        return self.acks_received + len(self.failed_nodes)
 
 
 @dataclass  
@@ -57,11 +65,23 @@ class QuorumManager:
         return (total_nodes // 2) + 1
         
     def write_with_quorum(self, file_name: str, file_content: bytes, 
-                          target_nodes: List, 
-                          consistency: ConsistencyLevel = ConsistencyLevel.QUORUM) -> WriteResult:
+                          consistency: ConsistencyLevel = ConsistencyLevel.QUORUM,
+                          target_nodes: List = None) -> WriteResult:
         """
         Escribe a múltiples nodos y espera confirmación de quorum.
+        
+        Args:
+            file_name: Nombre del archivo
+            file_content: Contenido del archivo
+            consistency: Nivel de consistencia (ONE, QUORUM, ALL)
+            target_nodes: Lista de nodos objetivo (si None, usa todos los activos)
+        
+        Returns:
+            WriteResult con información del resultado
         """
+        if target_nodes is None:
+            target_nodes = self.discovery.get_active_nodes()
+            
         total_targets = len(target_nodes)
         
         if consistency == ConsistencyLevel.ONE:
@@ -169,7 +189,7 @@ class QuorumManager:
         )
         
     def _send_write(self, node, file_name: str, file_content: bytes) -> bool:
-        """Envía escritura a un nodo"""
+        """Envía escritura a un nodo con flag de Quorum"""
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.settimeout(self.OPERATION_TIMEOUT)
@@ -180,7 +200,8 @@ class QuorumManager:
                     'file_name': file_name,
                     'file_size': len(file_content),
                     'timestamp': time.time(),
-                    'from_node': self.node_id
+                    'from_node': self.node_id,
+                    'is_quorum_write': True  # Indica que es una escritura Quorum
                 }
                 
                 req_json = json.dumps(request)

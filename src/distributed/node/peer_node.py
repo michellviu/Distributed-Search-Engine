@@ -51,9 +51,6 @@ class PeerNode:
         file_transfer = FileTransfer()
         self.repository = InMemoryDocumentRepository(self.indexer, search_engine)
         
-        # Indexar archivos existentes al inicio
-        self._index_initial_files()
-        
         # === Componentes Distribuidos ===
         
         # 1. Descubrimiento de nodos (usando IP Cache + seed nodes)
@@ -75,6 +72,10 @@ class PeerNode:
             node_id, 
             self.repository
         )
+        
+        # Indexar solo los archivos que nos corresponden según el hash ring
+        # (después de inicializar replication_manager para tener acceso al hash ring)
+        self._index_initial_files()
         
         # 4. Elección de líder y balanceo de carga
         self.election = LeaderElection(node_id, self.discovery)
@@ -99,7 +100,8 @@ class PeerNode:
             file_transfer, 
             node_id=node_id,
             discovery=self.discovery,
-            replication_manager=self.replication_manager
+            replication_manager=self.replication_manager,
+            quorum_manager=self.quorum_manager
         )
         
         # Configurar componentes distribuidos en el servidor
@@ -114,22 +116,60 @@ class PeerNode:
         self.active = True
         
     def _index_initial_files(self):
-        """Indexar archivos existentes en el directorio compartido"""
+        """
+        Indexar solo los archivos que le corresponden a este nodo según el hash ring.
+        Los archivos que no nos corresponden se ignoran (otro nodo los tiene).
+        """
         from pathlib import Path
         shared_dir = Path(self.index_path)
         if shared_dir.exists():
-            file_count = 0
+            indexed_count = 0
+            skipped_count = 0
+            
             for file_path in shared_dir.iterdir():
                 if file_path.is_file():
                     try:
-                        self.indexer.index_file(str(file_path))
-                        file_count += 1
-                        self.logger.info(f"📄 Indexado: {file_path.name}")
+                        file_name = file_path.name
+                        
+                        # Verificar si este archivo nos corresponde según el hash ring
+                        if self._should_store_file(file_name):
+                            self.indexer.index_file(str(file_path))
+                            indexed_count += 1
+                            self.logger.info(f"📄 Indexado (nos corresponde): {file_name}")
+                        else:
+                            skipped_count += 1
+                            self.logger.debug(f"⏭️ Saltado (no nos corresponde): {file_name}")
                     except Exception as e:
                         self.logger.error(f"Error indexando {file_path}: {e}")
-            self.logger.info(f"📁 Indexados {file_count} archivos iniciales de {self.index_path}")
+            
+            self.logger.info(f"📁 Indexados {indexed_count} archivos, saltados {skipped_count}")
         else:
             self.logger.warning(f"⚠️ Directorio {self.index_path} no existe")
+    
+    def _should_store_file(self, file_name: str) -> bool:
+        """
+        Determina si este nodo debe almacenar el archivo según el hash ring.
+        Un nodo debe almacenar un archivo si está entre los REPLICATION_FACTOR nodos
+        responsables de ese archivo.
+        """
+        # Actualizar el anillo con los nodos conocidos
+        self.replication_manager._update_ring()
+        
+        # Obtener los nodos responsables de este archivo
+        target_nodes = self.replication_manager.hash_ring.get_nodes_for_replication(
+            file_name, 
+            self.replication_manager.REPLICATION_FACTOR
+        )
+        
+        # Verificar si nuestro node_id está en la lista
+        # El node_id en el hash ring puede tener prefijo "node_"
+        our_ids = [self.node_id, f"node_{self.node_id}"]
+        
+        for target in target_nodes:
+            if target in our_ids or self.node_id in target:
+                return True
+        
+        return False
     
     def _check_leader_health(self):
         """
@@ -192,6 +232,12 @@ class PeerNode:
     def _on_node_failed(self, node_id: str, node_info: dict):
         """Callback: Un nodo falló health check"""
         self.logger.error(f"💀 Nodo falló: {node_id}")
+        
+        # Eliminar del discovery para que no aparezca en get_active_nodes()
+        with self.discovery._lock:
+            if node_id in self.discovery.nodes:
+                del self.discovery.nodes[node_id]
+                self.logger.info(f"🗑️ Nodo {node_id} eliminado del discovery")
         
         # Si el líder cayó, iniciar elección
         if self.election.current_leader and self.election.current_leader.node_id == node_id:
