@@ -350,14 +350,162 @@ class ReplicateCommand(Command):
             return {'status': 'error', 'message': str(e)}
 
 
+# ==================== Distributed Commands ====================
+
+class ElectionCommand(Command):
+    """Comando para manejar mensajes de elección de líder"""
+    
+    def __init__(self, election, from_node: str):
+        self.election = election
+        self.from_node = from_node
+        
+    def execute(self) -> Dict[str, Any]:
+        return self.election.handle_election_message(self.from_node)
+
+
+class CoordinatorCommand(Command):
+    """Comando para manejar anuncio de nuevo coordinador"""
+    
+    def __init__(self, election, coordinator_id: str, host: str, port: int):
+        self.election = election
+        self.coordinator_id = coordinator_id
+        self.host = host
+        self.port = port
+        
+    def execute(self) -> Dict[str, Any]:
+        self.election.handle_coordinator_message(
+            self.coordinator_id, 
+            self.host, 
+            self.port
+        )
+        return {'status': 'ok', 'action': 'coordinator'}
+
+
+class GetFileInfoCommand(Command):
+    """Comando para obtener info de un archivo específico"""
+    
+    def __init__(self, repository: DocumentRepository, file_name: str):
+        self.repository = repository
+        self.file_name = file_name
+        self.logger = logging.getLogger(__name__)
+        
+    def execute(self) -> Dict[str, Any]:
+        try:
+            file_info = self.repository.get_file_info(self.file_name)
+            if file_info:
+                return {
+                    'status': 'success',
+                    'action': 'get_file_info',
+                    'file_info': file_info,
+                    'timestamp': __import__('time').time()
+                }
+            return {
+                'status': 'error',
+                'action': 'get_file_info',
+                'message': 'File not found'
+            }
+        except Exception as e:
+            self.logger.error(f"Error getting file info: {e}")
+            return {'status': 'error', 'message': str(e)}
+
+
+class ClusterStatusCommand(Command):
+    """Comando para obtener estado del cluster"""
+    
+    def __init__(self, election, repository: DocumentRepository, node_id: str = None, discovery=None):
+        self.election = election
+        self.repository = repository
+        self.node_id = node_id
+        self.discovery = discovery
+        
+    def execute(self) -> Dict[str, Any]:
+        files = self.repository.get_all_indexed_files()
+        status = {
+            'status': 'success',
+            'action': 'cluster_status',
+            'node_id': self.node_id,
+            'indexed_files': len(files),
+            'files': [{'name': f.get('name'), 'size': f.get('size')} for f in files]
+        }
+        if self.election:
+            status['is_leader'] = self.election.is_leader()
+            if self.election.current_leader:
+                status['leader'] = self.election.current_leader.node_id
+        # Añadir info de peers conocidos
+        if self.discovery:
+            peers = self.discovery.get_active_nodes()
+            status['peers_count'] = len(peers)
+            status['peers'] = [{'node_id': p.node_id, 'host': p.host, 'port': p.port} for p in peers]
+        return status
+
+
+class GetPeersCommand(Command):
+    """Comando para obtener lista de peers conocidos (para discovery)"""
+    
+    def __init__(self, discovery, node_id: str):
+        self.discovery = discovery
+        self.node_id = node_id
+        
+    def execute(self) -> Dict[str, Any]:
+        peers = []
+        if self.discovery:
+            for node in self.discovery.get_active_nodes():
+                peers.append({
+                    'node_id': node.node_id,
+                    'host': node.host,
+                    'port': node.port,
+                    'node_type': node.node_type
+                })
+        return {
+            'status': 'success',
+            'action': 'get_peers',
+            'node_id': self.node_id,
+            'peers': peers
+        }
+
+
+class DistributedSearchCommand(Command):
+    """Comando para búsqueda distribuida en todo el cluster"""
+    
+    def __init__(self, distributed_search, query: str, file_type: str = None):
+        self.distributed_search = distributed_search
+        self.query = query
+        self.file_type = file_type
+        self.logger = logging.getLogger(__name__)
+        
+    def execute(self) -> Dict[str, Any]:
+        if not self.distributed_search:
+            return {
+                'status': 'error',
+                'action': 'distributed_search',
+                'message': 'Distributed search not available'
+            }
+        try:
+            return self.distributed_search.search(self.query, self.file_type)
+        except Exception as e:
+            self.logger.error(f"Distributed search failed: {e}")
+            return {
+                'status': 'error',
+                'action': 'distributed_search',
+                'message': str(e)
+            }
+
+
 # ==================== Command Factory ====================
 
 class CommandFactory:
     """Factory for creating commands based on requests"""
     
-    def __init__(self, repository: DocumentRepository, file_transfer=None):
+    def __init__(self, repository: DocumentRepository, file_transfer=None, 
+                 replication_manager=None, distributed_search=None, election=None,
+                 node_id: str = None, discovery=None):
         self.repository = repository
         self.file_transfer = file_transfer
+        self.replication_manager = replication_manager
+        self.distributed_search = distributed_search
+        self.election = election
+        self.node_id = node_id
+        self.discovery = discovery
         self.logger = logging.getLogger(__name__)
     
     def create_command(self, request: Dict[str, Any], file_content: bytes = None) -> Optional[Command]:
@@ -376,6 +524,9 @@ class CommandFactory:
         if action == 'search':
             query = request.get('query', '')
             file_type = request.get('file_type')
+            # Si hay búsqueda distribuida disponible, usarla por defecto
+            if self.distributed_search:
+                return DistributedSearchCommand(self.distributed_search, query, file_type)
             return SearchCommand(self.repository, query, file_type)
         
         elif action == 'index':
@@ -386,10 +537,12 @@ class CommandFactory:
             if file_name and file_content:
                 # Upload mode: file content provided
                 return IndexCommand(self.repository, file_path=None, 
-                                  file_name=file_name, file_content=file_content)
+                                  file_name=file_name, file_content=file_content,
+                                  replication_manager=self.replication_manager)
             else:
                 # Old mode: file path provided
-                return IndexCommand(self.repository, file_path=file_path)
+                return IndexCommand(self.repository, file_path=file_path,
+                                  replication_manager=self.replication_manager)
         
         elif action == 'download':
             file_id = request.get('file_id', '')
@@ -406,6 +559,50 @@ class CommandFactory:
             if file_name and file_content:
                 return ReplicateCommand(self.repository, file_name, file_content)
             return None
+        
+        # === Comandos Distribuidos ===
+        elif action == 'search_local':
+            # Búsqueda solo local (sin reenvío a otros nodos)
+            query = request.get('query', '')
+            file_type = request.get('file_type')
+            return SearchCommand(self.repository, query, file_type)
+        
+        elif action == 'election':
+            # Mensaje de elección de líder
+            from_node = request.get('from_node')
+            if self.election:
+                return ElectionCommand(self.election, from_node)
+            return None
+        
+        elif action == 'coordinator':
+            # Anuncio de nuevo coordinador
+            if self.election:
+                return CoordinatorCommand(
+                    self.election,
+                    request.get('coordinator_id'),
+                    request.get('coordinator_host'),
+                    request.get('coordinator_port')
+                )
+            return None
+        
+        elif action == 'get_file_info':
+            # Obtener info de archivo específico
+            file_name = request.get('file_name')
+            return GetFileInfoCommand(self.repository, file_name)
+        
+        elif action == 'cluster_status':
+            # Estado del cluster (para debugging)
+            return ClusterStatusCommand(self.election, self.repository, self.node_id, self.discovery)
+        
+        elif action == 'get_peers':
+            # Obtener lista de peers conocidos (para discovery)
+            return GetPeersCommand(self.discovery, self.node_id)
+        
+        elif action == 'distributed_search':
+            # Búsqueda distribuida en todo el cluster
+            query = request.get('query', '')
+            file_type = request.get('file_type')
+            return DistributedSearchCommand(self.distributed_search, query, file_type)
         
         else:
             self.logger.warning(f"Unknown action: {action}")
@@ -443,8 +640,29 @@ class SearchServer:
         self.node_id = node_id
         self.discovery = discovery
         self.replication_manager = replication_manager
-        self.command_factory = CommandFactory(repository, file_transfer, replication_manager)
+        self.election = None  # Set later if distributed
+        self.distributed_search = None  # Set later if distributed
+        self.command_factory = None  # Initialize after all components are set
         self.logger = logging.getLogger(__name__)
+        self._init_command_factory()
+    
+    def _init_command_factory(self):
+        """Initialize command factory with all components"""
+        self.command_factory = CommandFactory(
+            self.repository, 
+            self.file_transfer, 
+            self.replication_manager,
+            self.distributed_search,
+            self.election,
+            self.node_id,
+            self.discovery
+        )
+    
+    def set_distributed_components(self, election=None, distributed_search=None):
+        """Set distributed components after initialization"""
+        self.election = election
+        self.distributed_search = distributed_search
+        self._init_command_factory()
         
     def start(self):
         """Start the server and begin listening for connections"""

@@ -14,17 +14,25 @@ class HeartbeatMonitor:
     - Hace ping periódico a cada nodo (comando 'health' vía TCP)
     - Si un nodo no responde 3 veces consecutivas → marcado como muerto
     - Notifica cuando un nodo se recupera
+    - Callback periódico para verificar salud del líder
     """
     
-    CHECK_INTERVAL = 10  # segundos
-    MAX_FAILURES = 3
+    CHECK_INTERVAL = 5   # segundos (reducido para detectar fallos más rápido)
+    MAX_FAILURES = 2     # intentos antes de declarar muerto
+    LEADER_CHECK_INTERVAL = 10  # segundos entre verificaciones del líder
     
-    def __init__(self):
+    def __init__(self, election_callback: Callable = None):
+        """
+        Args:
+            election_callback: Callback opcional para verificar si el líder sigue vivo
+        """
         self.nodes: Dict[str, dict] = {}
         self.running = False
         self.on_node_failed: List[Callable] = []
         self.on_node_recovered: List[Callable] = []
+        self.election_callback = election_callback
         self._lock = threading.Lock()
+        self._last_leader_check = 0
         
     def register_node(self, node_id: str, host: str, port: int):
         """Registrar nodo para monitorear"""
@@ -59,6 +67,15 @@ class HeartbeatMonitor:
                 
             for node_id, node_info in nodes_copy.items():
                 self._check_node(node_id, node_info)
+            
+            # Verificar salud del líder periódicamente
+            current_time = time.time()
+            if self.election_callback and (current_time - self._last_leader_check) > self.LEADER_CHECK_INTERVAL:
+                self._last_leader_check = current_time
+                try:
+                    self.election_callback()
+                except Exception as e:
+                    pass  # Ignorar errores del callback
                 
             time.sleep(self.CHECK_INTERVAL)
             
