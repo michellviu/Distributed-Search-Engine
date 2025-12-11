@@ -1,0 +1,18 @@
+{
+    "nombre": "Configuración de Prueba",
+    "version": "1.0.0",
+    "descripcion": "Archivo JSON de configuración para pruebas",
+    "parametros": {
+        "replication_factor": 3,
+        "quorum_level": "QUORUM",
+        "heartbeat_interval": 5,
+        "timeout": 15
+    },
+    "nodos": [
+        {"id": "coord-1", "tipo": "coordinator", "puerto": 5000},
+        {"id": "proc-1", "tipo": "processing", "puerto": 6001},
+        {"id": "proc-2", "tipo": "processing", "puerto": 6002},
+        {"id": "proc-3", "tipo": "processing", "puerto": 6003}
+    ],
+    "estado": "activo"
+}

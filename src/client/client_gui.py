@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """
 GUI Client for Distributed Search Engine using CustomTkinter
-No JavaScript required - Pure Python solution
+Conecta directamente al sistema distribuido con soporte de failover
 """
 
 import sys
+import socket
+import json
 import threading
+import time
+import base64
 from pathlib import Path
 from typing import List, Dict, Optional
+from dataclasses import dataclass
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext
 
@@ -86,52 +91,368 @@ except ImportError:
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from client.client import SearchClient
 from utils.config import Config
 from utils.logger import setup_logging
 
 
-class SearchEngineGUI:
+# ============================================================================
+# Cliente Distribuido con Failover (integrado en GUI)
+# ============================================================================
+
+@dataclass
+class CoordinatorInfo:
+    """Información de un coordinador conocido"""
+    host: str
+    port: int
+    is_leader: bool = False
+    is_alive: bool = True
+    last_check: float = 0.0
+    failures: int = 0
+    
+    @property
+    def address(self) -> str:
+        return f"{self.host}:{self.port}"
+
+
+class DistributedClient:
     """
-    Graphical User Interface for the Search Engine Client
+    Cliente del sistema distribuido con soporte de failover.
+    Compatible con la interfaz esperada por SearchEngineGUI.
     """
     
-    def __init__(self, host: str = 'localhost', port: int = 5000):
+    MAX_RETRIES = 3
+    RETRY_DELAY = 1.0
+    HEALTH_CHECK_INTERVAL = 10
+    MAX_FAILURES_BEFORE_SKIP = 3
+    
+    def __init__(self, coordinator_addresses: List[str]):
+        """
+        Args:
+            coordinator_addresses: Lista de "host:port" de coordinadores
+        """
+        self.coordinators: List[CoordinatorInfo] = []
+        for addr in coordinator_addresses:
+            parts = addr.split(':')
+            host = parts[0]
+            port = int(parts[1]) if len(parts) > 1 else 5000
+            self.coordinators.append(CoordinatorInfo(host=host, port=port))
+        
+        if not self.coordinators:
+            raise ValueError("Se requiere al menos un coordinador")
+        
+        self.current_coordinator: Optional[CoordinatorInfo] = None
+        self._lock = threading.RLock()
+        self._active = True
+        
+        # Conectar al primer coordinador disponible
+        self._find_active_coordinator()
+        
+        # Health check en background
+        threading.Thread(target=self._health_check_loop, daemon=True).start()
+    
+    def _find_active_coordinator(self) -> bool:
+        """Encuentra un coordinador activo"""
+        with self._lock:
+            for coord in self.coordinators:
+                if coord.is_leader and coord.failures < self.MAX_FAILURES_BEFORE_SKIP:
+                    if self._check_coordinator_health(coord):
+                        self.current_coordinator = coord
+                        return True
+            
+            for coord in self.coordinators:
+                if coord.failures < self.MAX_FAILURES_BEFORE_SKIP:
+                    if self._check_coordinator_health(coord):
+                        self.current_coordinator = coord
+                        return True
+            
+            # Resetear y reintentar
+            for coord in self.coordinators:
+                coord.failures = 0
+                if self._check_coordinator_health(coord):
+                    self.current_coordinator = coord
+                    return True
+            
+            return False
+    
+    def _check_coordinator_health(self, coord: CoordinatorInfo) -> bool:
+        """Verifica si un coordinador está vivo"""
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(3)
+                sock.connect((coord.host, coord.port))
+                
+                request = {'action': 'health'}
+                self._send_request(sock, request)
+                response = self._receive_response(sock)
+                
+                if response and response.get('status') == 'ok':
+                    coord.is_alive = True
+                    coord.last_check = time.time()
+                    coord.failures = 0
+                    coord.is_leader = response.get('is_leader', True)
+                    return True
+        except:
+            pass
+        
+        coord.is_alive = False
+        coord.failures += 1
+        return False
+    
+    def _health_check_loop(self):
+        """Verifica periódicamente la salud de los coordinadores"""
+        while self._active:
+            time.sleep(self.HEALTH_CHECK_INTERVAL)
+            if self.current_coordinator:
+                if not self._check_coordinator_health(self.current_coordinator):
+                    self._find_active_coordinator()
+            for coord in self.coordinators:
+                if coord != self.current_coordinator:
+                    self._check_coordinator_health(coord)
+    
+    def _send_request(self, sock: socket.socket, request: dict):
+        """Envía una request al coordinador"""
+        req_json = json.dumps(request)
+        sock.sendall(f"{len(req_json):<8}".encode())
+        sock.sendall(req_json.encode())
+    
+    def _receive_response(self, sock: socket.socket) -> Optional[dict]:
+        """Recibe una respuesta del coordinador"""
+        try:
+            length_data = sock.recv(8)
+            if not length_data:
+                return None
+            
+            msg_len = int(length_data.decode().strip())
+            data = b''
+            while len(data) < msg_len:
+                chunk = sock.recv(min(4096, msg_len - len(data)))
+                if not chunk:
+                    break
+                data += chunk
+            
+            return json.loads(data.decode())
+        except:
+            return None
+    
+    def _execute_with_failover(self, request: dict) -> Optional[dict]:
+        """Ejecuta una request con soporte de failover"""
+        for attempt in range(self.MAX_RETRIES):
+            if not self.current_coordinator:
+                if not self._find_active_coordinator():
+                    return {'status': 'error', 'message': 'No hay coordinadores disponibles'}
+            
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                    sock.settimeout(10)
+                    sock.connect((
+                        self.current_coordinator.host,
+                        self.current_coordinator.port
+                    ))
+                    
+                    self._send_request(sock, request)
+                    response = self._receive_response(sock)
+                    
+                    if response:
+                        return response
+                    
+            except Exception:
+                self.current_coordinator.failures += 1
+                self.current_coordinator.is_alive = False
+                self.current_coordinator = None
+                
+                delay = self.RETRY_DELAY * (2 ** attempt)
+                time.sleep(delay)
+        
+        return {'status': 'error', 'message': 'Todos los reintentos fallaron'}
+    
+    # ========================================================================
+    # API compatible con SearchClient (usado por SearchEngineGUI)
+    # ========================================================================
+    
+    def search(self, query: str, file_type: Optional[str] = None) -> List[Dict]:
+        """
+        Busca archivos en el sistema distribuido.
+        
+        Returns:
+            Lista de resultados (compatible con SearchClient)
+        """
+        request = {
+            'action': 'search',
+            'query': query,
+            'file_type': file_type
+        }
+        response = self._execute_with_failover(request)
+        
+        if response and response.get('status') == 'success':
+            return response.get('results', [])
+        return []
+    
+    def list_files(self) -> List[Dict]:
+        """
+        Lista todos los archivos indexados.
+        
+        Returns:
+            Lista de archivos (compatible con SearchClient)
+        """
+        request = {'action': 'list'}
+        response = self._execute_with_failover(request)
+        
+        if response and response.get('status') == 'success':
+            return response.get('files', [])
+        return []
+    
+    def index_file(self, file_path: str) -> bool:
+        """
+        Indexa un archivo en el sistema distribuido.
+        
+        Args:
+            file_path: Ruta local del archivo
+            
+        Returns:
+            True si fue exitoso
+        """
+        file_path_obj = Path(file_path)
+        if not file_path_obj.exists():
+            return False
+        
+        try:
+            with open(file_path, 'rb') as f:
+                file_content = f.read()
+            
+            file_content_b64 = base64.b64encode(file_content).decode()
+            
+            # Paso 1: Preguntar al coordinador dónde almacenar
+            request = {
+                'action': 'store',
+                'file_name': file_path_obj.name,
+                'file_size': len(file_content),
+                'file_content': file_content_b64
+            }
+            response = self._execute_with_failover(request)
+            
+            return response and response.get('status') == 'success'
+            
+        except Exception:
+            return False
+    
+    def download_file(self, file_id: str, destination: str) -> bool:
+        """
+        Descarga un archivo del sistema distribuido.
+        
+        Args:
+            file_id: Nombre del archivo
+            destination: Directorio de destino
+            
+        Returns:
+            True si fue exitoso
+        """
+        try:
+            # Paso 1: Obtener ubicaciones
+            request = {
+                'action': 'download',
+                'file_id': file_id
+            }
+            response = self._execute_with_failover(request)
+            
+            if not response or response.get('status') != 'success':
+                return False
+            
+            file_content_b64 = response.get('file_content')
+            if not file_content_b64:
+                return False
+            
+            file_content = base64.b64decode(file_content_b64)
+            
+            # Guardar archivo
+            dest_path = Path(destination)
+            if dest_path.is_dir():
+                dest_path = dest_path / file_id
+            
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            with open(dest_path, 'wb') as f:
+                f.write(file_content)
+            
+            return True
+            
+        except Exception:
+            return False
+    
+    def get_cluster_status(self) -> dict:
+        """Obtiene el estado del cluster"""
+        request = {'action': 'cluster_status'}
+        return self._execute_with_failover(request) or {}
+    
+    def get_coordinators_status(self) -> List[dict]:
+        """Obtiene el estado de todos los coordinadores conocidos"""
+        return [
+            {
+                'address': coord.address,
+                'is_leader': coord.is_leader,
+                'is_alive': coord.is_alive,
+                'is_current': coord == self.current_coordinator,
+                'failures': coord.failures
+            }
+            for coord in self.coordinators
+        ]
+    
+    def close(self):
+        """Cierra el cliente"""
+        self._active = False
+
+
+class SearchEngineGUI:
+    """
+    Graphical User Interface for the Distributed Search Engine
+    Conecta al sistema distribuido con soporte de failover automático
+    """
+    
+    def __init__(self, coordinator_addresses: List[str] = None, host: str = 'localhost', port: int = 5000):
         """
         Initialize the GUI
         
         Args:
-            host: Server host
-            port: Server port
+            coordinator_addresses: Lista de "host:port" de coordinadores (preferido)
+            host: Host del coordinador (fallback si no se provee lista)
+            port: Puerto del coordinador (fallback si no se provee lista)
         """
-        self.host = host
-        self.port = port
-        self.client = None
+        # Construir lista de coordinadores
+        if coordinator_addresses:
+            self.coordinator_addresses = coordinator_addresses
+        else:
+            self.coordinator_addresses = [f"{host}:{port}"]
+        
+        self.client: Optional[DistributedClient] = None
         self.search_results: List[Dict] = []
         
         # Configure customtkinter appearance
         if CTK_AVAILABLE:
-            ctk.set_appearance_mode("dark")  # Modes: "System", "Dark", "Light"
-            ctk.set_default_color_theme("blue")  # Themes: "blue", "green", "dark-blue"
+            ctk.set_appearance_mode("dark")
+            ctk.set_default_color_theme("blue")
         
         # Create main window
         self.root = ctk.CTk() if CTK_AVAILABLE else tk.Tk()
-        self.root.title("Motor de Búsqueda Distribuida")
-        self.root.geometry("1000x700")
+        self.root.title("🔍 Motor de Búsqueda Distribuida")
+        self.root.geometry("1100x750")
         
-        # Try to connect to server
-        self._connect_to_server()
+        # Try to connect to coordinators
+        self._connect_to_cluster()
         
         # Setup UI
         self._setup_ui()
         
-    def _connect_to_server(self):
-        """Connect to the search server"""
+    def _connect_to_cluster(self):
+        """Conectar al cluster de coordinadores"""
         try:
-            self.client = SearchClient(self.host, self.port)
-            print(f"✓ Conectado al servidor {self.host}:{self.port}")
+            self.client = DistributedClient(self.coordinator_addresses)
+            if self.client.current_coordinator:
+                coord = self.client.current_coordinator
+                print(f"✓ Conectado al coordinador {coord.address}" + 
+                      (" (líder)" if coord.is_leader else ""))
+            else:
+                print("⚠ Cliente creado pero sin coordinador activo")
         except Exception as e:
-            print(f"⚠ Advertencia: No se pudo conectar al servidor: {e}")
+            print(f"⚠ Error conectando al cluster: {e}")
             self.client = None
     
     def _setup_ui(self):
@@ -148,15 +469,8 @@ class SearchEngineGUI:
         )
         title_label.pack(pady=(0, 20))
         
-        # Connection status
-        status_color = "green" if self.client else "red"
-        status_text = f"Conectado a {self.host}:{self.port}" if self.client else "Desconectado"
-        self.status_label = ctk.CTkLabel(
-            main_frame,
-            text=f"Estado: {status_text}",
-            text_color=status_color if CTK_AVAILABLE else None
-        )
-        self.status_label.pack(pady=(0, 10))
+        # Connection status frame
+        self._setup_status_frame(main_frame)
         
         # Search Frame
         self._setup_search_frame(main_frame)
@@ -170,6 +484,124 @@ class SearchEngineGUI:
         # Log Frame
         self._setup_log_frame(main_frame)
     
+    def _setup_status_frame(self, parent):
+        """Setup cluster status frame"""
+        status_frame = ctk.CTkFrame(parent)
+        status_frame.pack(fill="x", pady=(0, 10))
+        
+        # Estado de conexión
+        if self.client and self.client.current_coordinator:
+            coord = self.client.current_coordinator
+            status_text = f"✓ Conectado a {coord.address}"
+            if coord.is_leader:
+                status_text += " (Líder)"
+            status_color = "green"
+        else:
+            status_text = "✗ Desconectado"
+            status_color = "red"
+        
+        self.status_label = ctk.CTkLabel(
+            status_frame,
+            text=status_text,
+            text_color=status_color if CTK_AVAILABLE else None
+        )
+        self.status_label.pack(side="left", padx=10)
+        
+        # Botón para ver estado del cluster
+        self.cluster_status_btn = ctk.CTkButton(
+            status_frame,
+            text="📊 Estado Cluster",
+            command=self._show_cluster_status,
+            width=130
+        )
+        self.cluster_status_btn.pack(side="right", padx=10)
+        
+        # Botón reconectar
+        self.reconnect_btn = ctk.CTkButton(
+            status_frame,
+            text="🔄 Reconectar",
+            command=self._on_reconnect,
+            width=110
+        )
+        self.reconnect_btn.pack(side="right", padx=5)
+    
+    def _show_cluster_status(self):
+        """Muestra el estado del cluster en una ventana emergente"""
+        if not self.client:
+            messagebox.showerror("Error", "No hay cliente conectado")
+            return
+        
+        # Crear ventana de estado
+        status_window = ctk.CTkToplevel(self.root) if CTK_AVAILABLE else tk.Toplevel(self.root)
+        status_window.title("Estado del Cluster")
+        status_window.geometry("500x400")
+        status_window.transient(self.root)
+        
+        # Obtener estado de coordinadores
+        coord_status = self.client.get_coordinators_status()
+        
+        # Título
+        ctk.CTkLabel(
+            status_window,
+            text="🖥️ Estado de Coordinadores",
+            font=ctk.CTkFont(size=18, weight="bold") if CTK_AVAILABLE else ("Arial", 18, "bold")
+        ).pack(pady=10)
+        
+        # Lista de coordinadores
+        for coord in coord_status:
+            frame = ctk.CTkFrame(status_window)
+            frame.pack(fill="x", padx=10, pady=5)
+            
+            # Icono de estado
+            if coord['is_current']:
+                icon = "🟢"
+            elif coord['is_alive']:
+                icon = "🟡"
+            else:
+                icon = "🔴"
+            
+            role = " (Líder)" if coord['is_leader'] else ""
+            current = " ← Actual" if coord['is_current'] else ""
+            
+            text = f"{icon} {coord['address']}{role}{current}"
+            ctk.CTkLabel(frame, text=text).pack(side="left", padx=10)
+            
+            if coord['failures'] > 0:
+                ctk.CTkLabel(
+                    frame, 
+                    text=f"Fallos: {coord['failures']}",
+                    text_color="orange" if CTK_AVAILABLE else None
+                ).pack(side="right", padx=10)
+        
+        # Intentar obtener estado del cluster
+        try:
+            cluster_info = self.client.get_cluster_status()
+            if cluster_info and cluster_info.get('status') == 'success':
+                ctk.CTkLabel(
+                    status_window,
+                    text="\n📁 Información del Cluster",
+                    font=ctk.CTkFont(size=16, weight="bold") if CTK_AVAILABLE else ("Arial", 16, "bold")
+                ).pack(pady=10)
+                
+                info_frame = ctk.CTkFrame(status_window)
+                info_frame.pack(fill="x", padx=10, pady=5)
+                
+                nodes = cluster_info.get('nodes', [])
+                files = cluster_info.get('total_files', 0)
+                
+                ctk.CTkLabel(info_frame, text=f"Nodos de procesamiento: {len(nodes)}").pack(anchor="w", padx=10)
+                ctk.CTkLabel(info_frame, text=f"Archivos totales: {files}").pack(anchor="w", padx=10)
+        except:
+            pass
+        
+        # Botón cerrar
+        ctk.CTkButton(
+            status_window,
+            text="Cerrar",
+            command=status_window.destroy,
+            width=100
+        ).pack(pady=20)
+
     def _setup_search_frame(self, parent):
         """Setup search input frame"""
         search_frame = ctk.CTkFrame(parent)
@@ -359,14 +791,15 @@ class SearchEngineGUI:
             return
         
         query = self.search_entry.get().strip()
-        if not query:
-            self._log("Error: La búsqueda no puede estar vacía", "ERROR")
-            messagebox.showwarning("Advertencia", "Por favor ingresa un término de búsqueda")
-            return
-        
         file_type = self.file_type_entry.get().strip() or None
         
-        self._log(f"Buscando: '{query}'" + (f" (tipo: {file_type})" if file_type else ""))
+        # Permitir query vacía si hay file_type
+        if not query and not file_type:
+            self._log("Error: Ingresa un término de búsqueda o selecciona un tipo de archivo", "ERROR")
+            messagebox.showwarning("Advertencia", "Por favor ingresa un término de búsqueda o selecciona un tipo de archivo")
+            return
+        
+        self._log(f"Buscando: '{query or '*'}'" + (f" (tipo: {file_type})" if file_type else ""))
         
         # Run search in thread to avoid blocking UI
         threading.Thread(target=self._search_thread, args=(query, file_type), daemon=True).start()
@@ -486,33 +919,46 @@ class SearchEngineGUI:
     
     def _on_reconnect(self):
         """Handle reconnect button click"""
-        self._log("Intentando reconectar...")
-        self._connect_to_server()
+        self._log("Intentando reconectar al cluster...")
         
+        # Cerrar cliente anterior si existe
         if self.client:
-            status_text = f"Conectado a {self.host}:{self.port}"
-            self.status_label.configure(text=f"Estado: {status_text}", text_color="green" if CTK_AVAILABLE else None)
+            self.client.close()
+        
+        self._connect_to_cluster()
+        
+        if self.client and self.client.current_coordinator:
+            coord = self.client.current_coordinator
+            status_text = f"✓ Conectado a {coord.address}"
+            if coord.is_leader:
+                status_text += " (Líder)"
+            self.status_label.configure(text=status_text, text_color="green" if CTK_AVAILABLE else None)
             self._log("✓ Reconexión exitosa", "SUCCESS")
-            messagebox.showinfo("Éxito", "Reconectado al servidor")
+            messagebox.showinfo("Éxito", f"Reconectado al coordinador:\n{coord.address}")
         else:
-            status_text = "Desconectado"
-            self.status_label.configure(text=f"Estado: {status_text}", text_color="red" if CTK_AVAILABLE else None)
+            self.status_label.configure(text="✗ Desconectado", text_color="red" if CTK_AVAILABLE else None)
             self._log("Error al reconectar", "ERROR")
-            messagebox.showerror("Error", f"No se pudo conectar a {self.host}:{self.port}\n\nAsegúrate de que el servidor esté ejecutándose.")
+            messagebox.showerror("Error", "No se pudo conectar a ningún coordinador\n\nVerifica que el cluster esté en ejecución.")
     
     def run(self):
         """Run the GUI application"""
         self.root.mainloop()
+        # Cleanup on exit
+        if self.client:
+            self.client.close()
 
 
 def main():
     """Main function"""
     import argparse
+    import os
     
     parser = argparse.ArgumentParser(description='GUI Client for Distributed Search Engine')
     parser.add_argument('--config', type=str, default='config/client_config.json', help='Configuration file')
-    parser.add_argument('--host', type=str, help='Server host')
-    parser.add_argument('--port', type=int, help='Server port')
+    parser.add_argument('--coordinators', type=str, nargs='+', 
+                        help='Lista de coordinadores (host:port). Ej: --coordinators node1:5000 node2:5000')
+    parser.add_argument('--host', type=str, help='Host del coordinador principal (fallback)')
+    parser.add_argument('--port', type=int, help='Puerto del coordinador principal (fallback)')
     
     args = parser.parse_args()
     
@@ -530,13 +976,33 @@ def main():
         log_format=log_config.get('format')
     )
     
-    # Get server configuration
-    server_config = config.get('server', default={})
-    host = args.host or server_config.get('host', 'localhost')
-    port = args.port or server_config.get('port', 5000)
+    # Determinar coordinadores
+    coordinator_addresses = None
+    
+    # 1. Desde argumentos --coordinators
+    if args.coordinators:
+        coordinator_addresses = args.coordinators
+    
+    # 2. Desde variable de entorno
+    elif os.environ.get('COORDINATOR_ADDRESSES'):
+        coordinator_addresses = os.environ.get('COORDINATOR_ADDRESSES').split(',')
+    
+    # 3. Desde configuración (nueva sección 'distributed')
+    elif config.get('distributed', default={}):
+        dist_config = config.get('distributed', default={})
+        coordinator_addresses = dist_config.get('coordinators', [])
+    
+    # 4. Fallback: usar host:port del servidor
+    if not coordinator_addresses:
+        server_config = config.get('server', default={})
+        host = args.host or server_config.get('host', 'localhost')
+        port = args.port or server_config.get('port', 5000)
+        coordinator_addresses = [f"{host}:{port}"]
+    
+    print(f"🔗 Coordinadores configurados: {coordinator_addresses}")
     
     # Create and run GUI
-    app = SearchEngineGUI(host, port)
+    app = SearchEngineGUI(coordinator_addresses=coordinator_addresses)
     app.run()
 
 

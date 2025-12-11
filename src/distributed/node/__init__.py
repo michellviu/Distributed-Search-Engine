@@ -1,2 +1,5 @@
 # Node components
-from .peer_node import PeerNode
+from .coordinator_node import CoordinatorNode
+from .processing_node import ProcessingNode
+
+__all__ = ['CoordinatorNode', 'ProcessingNode']

@@ -1,159 +1,126 @@
 #!/usr/bin/env python3
 """
-Script principal para ejecutar un nodo del sistema distribuido.
+Punto de entrada principal para el sistema distribuido.
+
+Soporta dos roles:
+- coordinator: Nodo coordinador (no almacena datos)
+- processing: Nodo de procesamiento (almacena datos)
 
 Uso:
-    python main_distributed.py [opciones]
-
-Opciones:
-    --node-id, -n     ID único del nodo (default: auto-generado)
-    --host, -H        Host del nodo (default: 0.0.0.0)
-    --port, -p        Puerto TCP (default: 5000)
-    --index-path, -i  Directorio de archivos (default: shared_files)
-    --peers           Lista de peers iniciales (host:port,host:port,...)
-
-Descubrimiento:
-    El sistema usa UDP Multicast (239.255.255.250:5007) para descubrir nodos
-    automáticamente. También puede usar seed nodes para conexión directa.
+    # Iniciar coordinador
+    python -m src.main_distributed --role coordinator --id coord-1 --port 5000
+    
+    # Iniciar nodo de procesamiento
+    python -m src.main_distributed --role processing --id proc-1 --port 6001 \
+        --coordinator-host localhost --coordinator-port 5000
 """
 import sys
-import os
-import logging
 import argparse
-import socket
+import logging
+import os
 from pathlib import Path
 
-# Agregar src al path
-sys.path.insert(0, str(Path(__file__).parent))
+# Añadir src al path
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from distributed.node.peer_node import PeerNode
-
-# Configurar logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s | %(name)-25s | %(levelname)-8s | %(message)s',
-    datefmt='%H:%M:%S'
-)
-
-
-def get_container_ip():
-    """Obtiene la IP del contenedor/máquina"""
-    try:
-        # Método 1: usar hostname
-        hostname = socket.gethostname()
-        ip = socket.gethostbyname(hostname)
-        if ip and not ip.startswith('127.'):
-            return ip
-    except:
-        pass
-    
-    try:
-        # Método 2: conectar a un socket externo para obtener nuestra IP
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect(("8.8.8.8", 80))
-            return s.getsockname()[0]
-    except:
-        pass
-    
-    return "0.0.0.0"
-
-
-def get_node_id():
-    """Genera un ID único para el nodo basado en hostname"""
-    hostname = os.environ.get('HOSTNAME', socket.gethostname())
-    # Usar los últimos 12 caracteres del hostname para IDs más cortos
-    short_id = hostname[-12:] if len(hostname) > 12 else hostname
-    return f"node_{short_id}"
+from src.distributed.node.coordinator_node import CoordinatorNode
+from src.distributed.node.processing_node import ProcessingNode
+from src.utils.logger import setup_logging
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Nodo del sistema de búsqueda distribuido',
+        description='Sistema Distribuido de Búsqueda',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Ejemplos:
-  # Iniciar primer nodo
-  python main_distributed.py -n node1 -p 5000
+  # Iniciar coordinador
+  python -m src.main_distributed --role coordinator --id coord-1 --port 5000
   
-  # Iniciar segundo nodo conectándose al primero
-  python main_distributed.py -n node2 -p 5001 --peers 192.168.1.100:5000
-  
-  # Iniciar nodo con múltiples seeds
-  python main_distributed.py --peers 10.0.0.1:5000,10.0.0.2:5000
-"""
+  # Iniciar nodo de procesamiento
+  python -m src.main_distributed --role processing --id proc-1 --port 6001 \\
+      --coordinator-host localhost --coordinator-port 5000
+        """
     )
-    parser.add_argument('--node-id', '-n', type=str, default=None,
-                        help='ID único del nodo (default: auto-generado)')
-    parser.add_argument('--port', '-p', type=int, default=5000,
+    
+    # Argumentos comunes
+    parser.add_argument('--role', type=str, required=True,
+                        choices=['coordinator', 'processing'],
+                        help='Rol del nodo: coordinator o processing')
+    parser.add_argument('--id', type=str, 
+                        default=os.environ.get('NODE_ID', 'node-1'),
+                        help='ID único del nodo')
+    parser.add_argument('--host', type=str,
+                        default=os.environ.get('NODE_HOST', '0.0.0.0'),
+                        help='Host para bind (default: 0.0.0.0)')
+    parser.add_argument('--port', type=int,
+                        default=int(os.environ.get('NODE_PORT', '5000')),
                         help='Puerto TCP (default: 5000)')
-    parser.add_argument('--host', '-H', type=str, default='0.0.0.0',
-                        help='Host/IP para bind (default: 0.0.0.0)')
-    parser.add_argument('--index-path', '-i', type=str, default='shared_files',
-                        help='Directorio de archivos (default: shared_files)')
-    parser.add_argument('--peers', type=str, default=None,
-                        help='Seed peers: host1:port1,host2:port2,...')
+    parser.add_argument('--announce-host', type=str,
+                        default=os.environ.get('ANNOUNCE_HOST'),
+                        help='Host para anunciarse a otros nodos')
+    parser.add_argument('--log-level', type=str,
+                        default=os.environ.get('LOG_LEVEL', 'INFO'),
+                        help='Nivel de logging')
+    
+    # Argumentos para nodo de procesamiento
+    parser.add_argument('--coordinator-host', type=str,
+                        default=os.environ.get('COORDINATOR_HOST', 'localhost'),
+                        help='Host del coordinador')
+    parser.add_argument('--coordinator-port', type=int,
+                        default=int(os.environ.get('COORDINATOR_PORT', '5000')),
+                        help='Puerto del coordinador')
+    parser.add_argument('--index-path', type=str,
+                        default=os.environ.get('INDEX_PATH', 'shared_files'),
+                        help='Directorio de archivos a indexar')
     
     args = parser.parse_args()
     
-    # Obtener IP real para anunciarse
-    announce_host = get_container_ip() if args.host == '0.0.0.0' else args.host
-    node_id = args.node_id or get_node_id()
+    # Configurar logging
+    setup_logging(level=args.log_level)
+    logger = logging.getLogger('main_distributed')
     
-    # Parsear peers iniciales
-    seed_nodes = []
-    if args.peers:
-        for peer in args.peers.split(','):
-            peer = peer.strip()
-            if peer:
-                if ':' in peer:
-                    host, port = peer.split(':')
-                    seed_nodes.append((host.strip(), int(port.strip())))
-                else:
-                    seed_nodes.append((peer.strip(), 5000))
-    
-    # También obtener peers de variable de entorno
-    env_peers = os.environ.get('SEED_NODES', '')
-    if env_peers:
-        for peer in env_peers.split(','):
-            peer = peer.strip()
-            if peer:
-                if ':' in peer:
-                    host, port = peer.split(':')
-                    seed_nodes.append((host.strip(), int(port.strip())))
-                else:
-                    seed_nodes.append((peer.strip(), 5000))
-    
-    print("=" * 60)
-    print("   SISTEMA DE BÚSQUEDA DISTRIBUIDO")
-    print("   Descubrimiento: UDP Multicast + Seed Nodes")
-    print("=" * 60)
-    print(f"   Node ID:       {node_id}")
-    print(f"   Bind Host:     {args.host}")
-    print(f"   Announce Host: {announce_host}")
-    print(f"   Port:          {args.port}")
-    print(f"   Index Path:    {args.index_path}")
-    print(f"   Seed Nodes:    {seed_nodes if seed_nodes else 'Ninguno'}")
-    print(f"   Multicast:     239.255.255.250:5007")
-    print("=" * 60)
-    
-    # Crear y arrancar nodo
-    # Usar 0.0.0.0 para bind (aceptar conexiones de cualquier interfaz)
-    # pero announce_host para anunciarse a otros nodos
-    node = PeerNode(
-        node_id=node_id,
-        host=args.host,  # 0.0.0.0 para bind
-        port=args.port,
-        index_path=args.index_path,
-        seed_nodes=seed_nodes,
-        announce_host=announce_host  # IP real para anunciarse
-    )
+    logger.info("=" * 60)
+    logger.info("   SISTEMA DISTRIBUIDO DE BÚSQUEDA")
+    logger.info("=" * 60)
+    logger.info(f"   Rol:  {args.role.upper()}")
+    logger.info(f"   ID:   {args.id}")
+    logger.info(f"   Host: {args.host}:{args.port}")
+    logger.info("=" * 60)
     
     try:
-        node.start()
+        if args.role == 'coordinator':
+            # Iniciar nodo coordinador
+            node = CoordinatorNode(
+                coordinator_id=args.id,
+                host=args.host,
+                port=args.port,
+                announce_host=args.announce_host
+            )
+            node.start()
+            
+        elif args.role == 'processing':
+            # Iniciar nodo de procesamiento
+            node = ProcessingNode(
+                node_id=args.id,
+                host=args.host,
+                port=args.port,
+                index_path=args.index_path,
+                coordinator_host=args.coordinator_host,
+                coordinator_port=args.coordinator_port,
+                announce_host=args.announce_host
+            )
+            node.start()
+            
     except KeyboardInterrupt:
-        print("\n⚠️ Interrupción recibida...")
-    finally:
-        node.stop()
+        logger.info("\n⚠️  Interrupción de teclado recibida")
+        if 'node' in locals():
+            node.stop()
+    except Exception as e:
+        logger.error(f"❌ Error fatal: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 
 
 if __name__ == '__main__':

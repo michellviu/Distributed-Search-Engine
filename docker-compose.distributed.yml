@@ -1,0 +1,110 @@
+# Docker Compose para Sistema Distribuido con Swarm
+# 
+# Uso:
+#   1. Inicializar swarm: docker swarm init
+#   2. Construir imagen: docker build -f Dockerfile.distributed -t search-engine:distributed .
+#   3. Desplegar: docker stack deploy -c docker-compose.distributed.yml search
+#   4. Escalar nodos: docker service scale search_processing=5
+#   5. Ver logs: docker service logs -f search_coordinator
+#   6. Eliminar: docker stack rm search
+
+version: '3.8'
+
+services:
+  # ==========================================================================
+  # COORDINADOR PRINCIPAL
+  # ==========================================================================
+  coordinator:
+    image: search-engine:distributed
+    hostname: coordinator
+    environment:
+      - NODE_ROLE=coordinator
+      - NODE_ID=coordinator-1
+      - NODE_HOST=0.0.0.0
+      - NODE_PORT=5000
+      - LOG_LEVEL=INFO
+    ports:
+      - "5000:5000"
+    networks:
+      - search-network
+    volumes:
+      - coordinator-logs:/home/app/logs
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "5000"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ==========================================================================
+  # NODOS DE PROCESAMIENTO
+  # ==========================================================================
+  processing:
+    image: search-engine:distributed
+    environment:
+      - NODE_ROLE=processing
+      - NODE_HOST=0.0.0.0
+      - NODE_PORT=5000
+      - COORDINATOR_HOST=coordinator
+      - COORDINATOR_PORT=5000
+      - INDEX_PATH=/home/app/data
+      - INIT_FILES_PATH=/home/app/shared_files
+      - AUTO_INDEX=true
+      - LOG_LEVEL=INFO
+    networks:
+      - search-network
+    volumes:
+      # Archivos iniciales de prueba (solo lectura)
+      - shared-files:/home/app/shared_files:ro
+      # Directorio de trabajo local para cada nodo
+      - processing-data:/home/app/data
+      - processing-logs:/home/app/logs
+    depends_on:
+      - coordinator
+    deploy:
+      replicas: 3
+      update_config:
+        parallelism: 1
+        delay: 10s
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "5000"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+networks:
+  search-network:
+    driver: overlay
+    attachable: true
+
+volumes:
+  shared-files:
+    driver: local
+  processing-data:
+    driver: local
+  coordinator-logs:
+  processing-logs:

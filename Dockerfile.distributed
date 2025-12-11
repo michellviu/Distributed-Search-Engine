@@ -1,35 +1,44 @@
-# Dockerfile para Distributed Search Engine
+# Dockerfile para Sistema Distribuido de Búsqueda
+# Soporta dos roles: COORDINATOR y PROCESSING
 FROM python:3.12-slim
 
 # Crear directorio de trabajo
-WORKDIR /app
+WORKDIR /home/app
 
-# Copiar requirements primero (para cache de Docker)
-COPY requirements.txt /app/
+# Instalar utilidades de red para debugging
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    netcat-openbsd \
+    iputils-ping \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copiar todo el proyecto
+COPY . /home/app
 
 # Instalar dependencias
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt
 
-# Copiar código fuente
-COPY src/ /app/src/
-COPY config/ /app/config/
-
-# Crear carpetas necesarias (shared_files vacío - los datos se replican)
-RUN mkdir -p /app/logs /app/downloads /app/shared_files
-
-# Establecer PYTHONPATH
-ENV PYTHONPATH=/app/src
-
-# Exponer puertos
-# 5000: TCP principal (servidor)
-EXPOSE 5000
+# Crear carpetas necesarias
+RUN mkdir -p logs downloads shared_files data
 
 # Variables de entorno por defecto
+ENV NODE_ROLE=processing
+ENV NODE_ID=node-1
+ENV NODE_HOST=0.0.0.0
 ENV NODE_PORT=5000
-ENV INDEX_PATH=/app/shared_files
-ENV NODE_ID=
-ENV SEED_NODES=
+ENV COORDINATOR_HOST=coordinator
+ENV COORDINATOR_PORT=5000
+ENV ANNOUNCE_HOST=""
+ENV INDEX_PATH=/home/app/shared_files
+ENV AUTO_INDEX=true
+ENV PYTHONUNBUFFERED=1
 
-# Comando por defecto: iniciar nodo distribuido
-CMD ["python", "src/main_distributed.py", "--host", "0.0.0.0", "--port", "5000"]
+# Exponer puertos
+EXPOSE 5000
+
+# Script de entrada
+COPY docker-entrypoint.sh /docker-entrypoint.sh
+RUN chmod +x /docker-entrypoint.sh
+
+ENTRYPOINT ["/docker-entrypoint.sh"]
