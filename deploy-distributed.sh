@@ -76,7 +76,7 @@ echo -e "${GREEN}   ✓ Archivos copiados a volumen shared-files${NC}"
 
 # Desplegar el stack
 echo -e "${GREEN}🚀 Desplegando stack '$STACK_NAME'...${NC}"
-docker stack deploy -c docker-compose.distributed.yml "$STACK_NAME"
+docker stack deploy -c docker-compose.yml "$STACK_NAME"
 
 # Esperar a que los servicios estén listos
 echo -e "${YELLOW}⏳ Esperando a que los servicios inicien...${NC}"

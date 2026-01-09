@@ -1,8 +1,7 @@
 {
     "distributed": {
         "coordinators": [
-            "localhost:5000",
-            "localhost:5001"
+            "localhost:4000"
         ],
         "auto_reconnect": true,
         "reconnect_interval": 5

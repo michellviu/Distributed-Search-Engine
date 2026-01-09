@@ -74,6 +74,23 @@ services:
         delay: 5s
 
   # ---------------------------------------------------------------------------
+  # LOAD BALANCER (NGINX) - Punto de entrada único
+  # ---------------------------------------------------------------------------
+  load_balancer:
+    image: nginx:latest
+    ports:
+      - "4000:80"  # Puerto unificado expuesto al cliente
+    configs:
+      - source: nginx_conf
+        target: /etc/nginx/nginx.conf
+    networks:
+      - search-network
+    deploy:
+      mode: global  # Una instancia en CADA nodo (alta disponibilidad)
+      restart_policy:
+        condition: on-failure
+
+  # ---------------------------------------------------------------------------
   # NODOS DE PROCESAMIENTO (almacenan archivos, ejecutan búsquedas)
   # ---------------------------------------------------------------------------
   processing:
@@ -114,3 +131,10 @@ networks:
 volumes:
   shared-files:
     external: true
+
+# =============================================================================
+# CONFIGURACIONES (Distribuidas automáticamente por Swarm)
+# =============================================================================
+configs:
+  nginx_conf:
+    file: ./nginx/nginx.conf
