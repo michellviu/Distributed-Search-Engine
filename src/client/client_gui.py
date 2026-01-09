@@ -10,6 +10,8 @@ import json
 import threading
 import time
 import base64
+import logging
+import os
 from pathlib import Path
 from typing import List, Dict, Optional
 from dataclasses import dataclass
@@ -93,6 +95,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from utils.config import Config
 from utils.logger import setup_logging
+from client.coordinator_discovery import CoordinatorDiscovery
 
 
 # ============================================================================
@@ -125,30 +128,47 @@ class DistributedClient:
     HEALTH_CHECK_INTERVAL = 10
     MAX_FAILURES_BEFORE_SKIP = 3
     
-    def __init__(self, coordinator_addresses: List[str]):
+    def __init__(self, coordinator_addresses: List[str] = None):
         """
         Args:
-            coordinator_addresses: Lista de "host:port" de coordinadores
+            coordinator_addresses: Lista de "host:port" de coordinadores (opcional)
+                                   Si no se proporciona, usa descubrimiento automático
         """
+        self.logger = logging.getLogger("DistributedClient")
+        
+        # Usar descubrimiento automático o direcciones proporcionadas
+        if coordinator_addresses:
+            discovery = CoordinatorDiscovery(initial_addresses=coordinator_addresses)
+        else:
+            discovery = CoordinatorDiscovery()
+        
+        self.discovery = discovery
+        
+        # Convertir direcciones descubiertas a CoordinatorInfo
         self.coordinators: List[CoordinatorInfo] = []
-        for addr in coordinator_addresses:
+        for addr in discovery.get_coordinators():
             parts = addr.split(':')
             host = parts[0]
             port = int(parts[1]) if len(parts) > 1 else 5000
             self.coordinators.append(CoordinatorInfo(host=host, port=port))
         
         if not self.coordinators:
-            raise ValueError("Se requiere al menos un coordinador")
+            raise ValueError("No se encontraron coordinadores")
         
         self.current_coordinator: Optional[CoordinatorInfo] = None
         self._lock = threading.RLock()
         self._active = True
+        
+        self.logger.info(f"Cliente inicializado con {len(self.coordinators)} coordinadores")
         
         # Conectar al primer coordinador disponible
         self._find_active_coordinator()
         
         # Health check en background
         threading.Thread(target=self._health_check_loop, daemon=True).start()
+        
+        # Descubrimiento automático cada 30 segundos
+        self.discovery.start_auto_discovery(interval=30)
     
     def _find_active_coordinator(self) -> bool:
         """Encuentra un coordinador activo"""
@@ -412,15 +432,20 @@ class SearchEngineGUI:
         Initialize the GUI
         
         Args:
-            coordinator_addresses: Lista de "host:port" de coordinadores (preferido)
-            host: Host del coordinador (fallback si no se provee lista)
-            port: Puerto del coordinador (fallback si no se provee lista)
+            coordinator_addresses: Lista de "host:port" de coordinadores (opcional)
+                                   Si no se proporciona, usa descubrimiento automático
+            host: Host del coordinador (ignorado si se usa descubrimiento)
+            port: Puerto del coordinador (ignorado si se usa descubrimiento)
         """
-        # Construir lista de coordinadores
+        # Usar coordinadores configurados o descubrimiento automático
         if coordinator_addresses:
             self.coordinator_addresses = coordinator_addresses
-        else:
+        elif host != 'localhost' or port != 5000:
+            # Si se especifican host/port diferentes, usarlos
             self.coordinator_addresses = [f"{host}:{port}"]
+        else:
+            # Usar descubrimiento automático (None)
+            self.coordinator_addresses = None
         
         self.client: Optional[DistributedClient] = None
         self.search_results: List[Dict] = []
@@ -444,11 +469,18 @@ class SearchEngineGUI:
     def _connect_to_cluster(self):
         """Conectar al cluster de coordinadores"""
         try:
-            self.client = DistributedClient(self.coordinator_addresses)
+            # Usar coordinadores configurados o descubrimiento automático
+            if self.coordinator_addresses:
+                self.client = DistributedClient(self.coordinator_addresses)
+            else:
+                # Descubrimiento automático
+                self.client = DistributedClient()
+            
             if self.client.current_coordinator:
                 coord = self.client.current_coordinator
                 print(f"✓ Conectado al coordinador {coord.address}" + 
                       (" (líder)" if coord.is_leader else ""))
+                print(f"  Total de coordinadores disponibles: {len(self.client.coordinators)}")
             else:
                 print("⚠ Cliente creado pero sin coordinador activo")
         except Exception as e:
@@ -992,14 +1024,14 @@ def main():
         dist_config = config.get('distributed', default={})
         coordinator_addresses = dist_config.get('coordinators', [])
     
-    # 4. Fallback: usar host:port del servidor
-    if not coordinator_addresses:
-        server_config = config.get('server', default={})
-        host = args.host or server_config.get('host', 'localhost')
-        port = args.port or server_config.get('port', 5000)
-        coordinator_addresses = [f"{host}:{port}"]
+    # 4. Si aún no hay coordinadores, usar descubrimiento automático
+    # (None indica descubrimiento automático en Docker Swarm)
     
-    print(f"🔗 Coordinadores configurados: {coordinator_addresses}")
+    if coordinator_addresses:
+        print(f"🔗 Coordinadores configurados: {coordinator_addresses}")
+    else:
+        print("🔍 Usando descubrimiento automático de coordinadores en Docker Swarm...")
+        print("   Buscando servicio 'search_coordinator' en la red")
     
     # Create and run GUI
     app = SearchEngineGUI(coordinator_addresses=coordinator_addresses)

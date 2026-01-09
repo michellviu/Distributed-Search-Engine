@@ -74,6 +74,11 @@ Ejemplos:
                         default=os.environ.get('INDEX_PATH', 'shared_files'),
                         help='Directorio de archivos a indexar')
     
+    # Argumentos para cluster de coordinadores (Bully)
+    parser.add_argument('--peer-coordinators', type=str,
+                        default=os.environ.get('PEER_COORDINATORS', ''),
+                        help='Lista de otros coordinadores: "host1:port1,host2:port2"')
+    
     args = parser.parse_args()
     
     # Configurar logging
@@ -90,12 +95,20 @@ Ejemplos:
     
     try:
         if args.role == 'coordinator':
+            # Parsear lista de peers de coordinadores
+            peer_coordinators = []
+            if args.peer_coordinators:
+                peer_coordinators = [p.strip() for p in args.peer_coordinators.split(',') if p.strip()]
+            
+            logger.info(f"   Peers: {len(peer_coordinators)} coordinadores")
+            
             # Iniciar nodo coordinador
             node = CoordinatorNode(
                 coordinator_id=args.id,
                 host=args.host,
                 port=args.port,
-                announce_host=args.announce_host
+                announce_host=args.announce_host,
+                peer_coordinators=peer_coordinators
             )
             node.start()
             

@@ -1,0 +1,107 @@
+version: '3.8'
+# =============================================================================
+# SISTEMA DISTRIBUIDO DE BÚSQUEDA - Docker Swarm
+# =============================================================================
+# Arquitectura:
+#   - 2 Coordinadores (algoritmo Bully para elección de líder)
+#   - N Nodos de procesamiento (almacenan y buscan archivos)
+#   - Factor de replicación: 3
+#
+# Uso:
+#   1. Iniciar Swarm:     docker swarm init
+#   2. Crear volumen:     docker volume create shared-files
+#   3. Agregar archivos:  docker run --rm -v shared-files:/data -v $(pwd)/shared_files:/src alpine cp -r /src/. /data/
+#   4. Desplegar:         docker stack deploy -c docker-compose.yml search
+#   5. Ver servicios:     docker service ls
+#   6. Ver logs:          docker service logs search_coordinator1
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # COORDINADOR 1 (puede ser líder)
+  # ---------------------------------------------------------------------------
+  coordinator1:
+    image: search-engine:distributed
+    hostname: coordinator1
+    environment:
+      - NODE_ROLE=coordinator
+      - NODE_ID=coord-1
+      - NODE_HOST=0.0.0.0
+      - NODE_PORT=5000
+      - ANNOUNCE_HOST=coordinator1
+      - PEER_COORDINATORS=coordinator2:5000
+      - REPLICATION_FACTOR=3
+      - LOG_LEVEL=INFO
+    ports:
+      - "5000:5000"
+    networks:
+      - search-network
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+
+  # ---------------------------------------------------------------------------
+  # COORDINADOR 2 (failover, algoritmo Bully)
+  # ---------------------------------------------------------------------------
+  coordinator2:
+    image: search-engine:distributed
+    hostname: coordinator2
+    environment:
+      - NODE_ROLE=coordinator
+      - NODE_ID=coord-2
+      - NODE_HOST=0.0.0.0
+      - NODE_PORT=5000
+      - ANNOUNCE_HOST=coordinator2
+      - PEER_COORDINATORS=coordinator1:5000
+      - REPLICATION_FACTOR=3
+      - LOG_LEVEL=INFO
+    ports:
+      - "5001:5000"
+    networks:
+      - search-network
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+
+  # ---------------------------------------------------------------------------
+  # NODOS DE PROCESAMIENTO (almacenan archivos, ejecutan búsquedas)
+  # ---------------------------------------------------------------------------
+  processing:
+    image: search-engine:distributed
+    environment:
+      - NODE_ROLE=processing
+      - NODE_HOST=0.0.0.0
+      - NODE_PORT=5000
+      - COORDINATOR_HOST=coordinator1
+      - COORDINATOR_PORT=5000
+      - INIT_FILES_PATH=/home/app/shared_files
+      - AUTO_INDEX=true
+      - LOG_LEVEL=INFO
+    networks:
+      - search-network
+    volumes:
+      - shared-files:/home/app/shared_files
+    deploy:
+      replicas: 3
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+
+# =============================================================================
+# RED OVERLAY (comunicación entre nodos en diferentes máquinas)
+# =============================================================================
+networks:
+  search-network:
+    driver: overlay
+    attachable: true
+
+# =============================================================================
+# VOLUMEN COMPARTIDO (archivos a indexar)
+# =============================================================================
+volumes:
+  shared-files:
+    external: true

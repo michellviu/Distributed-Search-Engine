@@ -155,24 +155,105 @@ class ProcessingNode:
         self.logger.info("👋 Nodo de procesamiento detenido")
     
     def _index_initial_files(self):
-        """Indexa los archivos existentes en el directorio"""
+        """
+        Indexa los archivos existentes en el directorio.
+        
+        Si hay coordinador configurado, consulta qué archivos debe indexar
+        para mantener el balanceo entre nodos. Si no hay coordinador o
+        falla la consulta, indexa todos los archivos locales.
+        """
         shared_dir = Path(self.index_path)
         if not shared_dir.exists():
             self.logger.warning(f"⚠️ Directorio {self.index_path} no existe")
             return
         
+        # Obtener lista de archivos disponibles localmente
+        local_files = [f.name for f in shared_dir.iterdir() if f.is_file()]
+        
+        if not local_files:
+            self.logger.info("📁 No hay archivos locales para indexar")
+            return
+        
+        self.logger.info(f"📋 Archivos locales disponibles: {len(local_files)}")
+        
+        # Si hay coordinador, consultar qué archivos debemos indexar
+        files_to_index = local_files
+        if self.coordinator_host:
+            assigned_files = self._request_file_assignment(local_files)
+            if assigned_files is not None:
+                files_to_index = assigned_files
+                self.logger.info(f"🎯 Coordinador asignó {len(files_to_index)} archivos a este nodo")
+            else:
+                self.logger.warning("⚠️ No se pudo consultar al coordinador, indexando todos los archivos locales")
+        
+        # Indexar solo los archivos asignados
         count = 0
-        for file_path in shared_dir.iterdir():
-            if file_path.is_file():
+        for file_name in files_to_index:
+            file_path = shared_dir / file_name
+            if file_path.exists() and file_path.is_file():
                 try:
                     self.indexer.index_file(str(file_path))
                     count += 1
-                    self.logger.debug(f"📄 Indexado: {file_path.name}")
+                    self.logger.debug(f"📄 Indexado: {file_name}")
                 except Exception as e:
                     self.logger.error(f"Error indexando {file_path}: {e}")
         
         self.stats['files_indexed'] = count
         self.logger.info(f"📁 Indexados {count} archivos del directorio {self.index_path}")
+    
+    def _request_file_assignment(self, available_files: List[str]) -> Optional[List[str]]:
+        """
+        Solicita al coordinador qué archivos de los disponibles debe indexar este nodo.
+        
+        El coordinador usa balanceo de carga para asignar archivos:
+        - Archivos que nadie tiene: asigna a este nodo según replication_factor
+        - Archivos que ya tienen otros nodos: no asigna (a menos que falten réplicas)
+        
+        Args:
+            available_files: Lista de archivos disponibles localmente
+            
+        Returns:
+            Lista de archivos que este nodo debe indexar, o None si falla
+        """
+        if not self.coordinator_host:
+            return None
+        
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(10)
+                sock.connect((self.coordinator_host, self.coordinator_port))
+                
+                request = {
+                    'action': 'request_file_assignment',
+                    'node_id': self.node_id,
+                    'available_files': available_files,
+                    'host': self.announce_host,
+                    'port': self.port
+                }
+                
+                req_json = json.dumps(request)
+                sock.sendall(f"{len(req_json):<8}".encode())
+                sock.sendall(req_json.encode())
+                
+                # Leer respuesta
+                length_data = sock.recv(8)
+                if length_data:
+                    msg_len = int(length_data.decode().strip())
+                    data = b''
+                    while len(data) < msg_len:
+                        chunk = sock.recv(min(4096, msg_len - len(data)))
+                        if not chunk:
+                            break
+                        data += chunk
+                    response = json.loads(data.decode())
+                    
+                    if response.get('status') == 'success':
+                        return response.get('assigned_files', [])
+                
+        except Exception as e:
+            self.logger.warning(f"⚠️ Error solicitando asignación de archivos: {e}")
+        
+        return None
     
     def _start_server(self):
         """Inicia el servidor TCP interno"""

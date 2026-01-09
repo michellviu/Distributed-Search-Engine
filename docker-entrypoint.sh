@@ -20,6 +20,7 @@ echo "NODE_PORT:        $NODE_PORT"
 echo "COORDINATOR_HOST: $COORDINATOR_HOST"
 echo "COORDINATOR_PORT: $COORDINATOR_PORT"
 echo "ANNOUNCE_HOST:    $ANNOUNCE_HOST"
+echo "PEER_COORDINATORS:$PEER_COORDINATORS"
 echo "INDEX_PATH:       $INDEX_PATH"
 echo "INIT_FILES_PATH:  $INIT_FILES_PATH"
 echo "AUTO_INDEX:       $AUTO_INDEX"
@@ -82,12 +83,14 @@ echo "📡 Host de anuncio: $ANNOUNCE_HOST"
 case "$NODE_ROLE" in
     "coordinator")
         echo "🎯 Iniciando como COORDINADOR..."
+        echo "📡 Peers de coordinadores: $PEER_COORDINATORS"
         exec python -m src.main_distributed \
             --role coordinator \
             --id "$NODE_ID" \
             --host "$NODE_HOST" \
             --port "$NODE_PORT" \
-            --announce-host "$ANNOUNCE_HOST"
+            --announce-host "$ANNOUNCE_HOST" \
+            --peer-coordinators "$PEER_COORDINATORS"
         ;;
     
     "processing")

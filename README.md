@@ -1,147 +1,218 @@
 # Distributed-Search-Engine
 
-📖 **Proyecto de Sistema de Búsqueda Distribuida**
+📖 **Sistema de Búsqueda Distribuida**
 
-Este proyecto implementa un motor de búsqueda de documentos **totalmente distribuido**, desarrollado como parte del curso de Sistemas Distribuidos.
+Motor de búsqueda de documentos distribuido desarrollado para el curso de Sistemas Distribuidos.
 
 ## Descripción General
 
-El Motor de Búsqueda Distribuida es un sistema robusto y escalable para buscar y acceder a documentos a través de múltiples nodos. A diferencia de una arquitectura centralizada, este sistema utiliza una arquitectura **P2P (Peer-to-Peer) Estructurada** donde:
+El sistema implementa una arquitectura **Coordinador/Nodos de Procesamiento** donde:
 
-- **Arquitectura P2P:** Todos los nodos colaboran para almacenar y buscar información.
-- **Coordinador Dinámico:** Se elige automáticamente un líder para tareas de gestión, con recuperación automática ante fallos.
-- **Consistent Hashing:** Los datos se distribuyen uniformemente en un anillo lógico.
-- **Replicación y Tolerancia a Fallos:** Cada documento se replica en múltiples nodos (Factor N=3) para garantizar disponibilidad incluso si caen nodos.
+- **Nodo Coordinador**: Gestiona el cluster, mantiene el índice de ubicaciones, NO almacena datos
+- **Nodos de Procesamiento**: Almacenan archivos, ejecutan búsquedas locales, reportan al coordinador
+- **Replicación**: Cada archivo se replica en N nodos (por defecto N=3) para tolerancia a fallos
+- **Balanceo de Carga**: El coordinador asigna archivos a los nodos menos cargados
+
+## Arquitectura
+
+```
+                    ┌─────────────────────────────────────┐
+                    │           COORDINADOR               │
+                    │  - Registro de nodos (ID -> IP)     │
+                    │  - Índice de archivos (file -> nodes)│
+                    │  - Heartbeat monitoring             │
+                    │  - Balanceo de carga                │
+                    │  - CHORD DNS (localización)         │
+                    │  - Quorum (consistencia)            │
+                    │  - NO ALMACENA DATOS                │
+                    └────────────────┬────────────────────┘
+                                     │
+         ┌───────────────────────────┼───────────────────────────┐
+         │                           │                           │
+         ▼                           ▼                           ▼
+┌─────────────────┐         ┌─────────────────┐         ┌─────────────────┐
+│  PROCESAMIENTO  │         │  PROCESAMIENTO  │         │  PROCESAMIENTO  │
+│     Nodo 1      │         │     Nodo 2      │         │     Nodo 3      │
+│  - Almacena     │         │  - Almacena     │         │  - Almacena     │
+│    archivos     │         │    archivos     │         │    archivos     │
+│  - Indexación   │         │  - Indexación   │         │  - Indexación   │
+│  - Búsqueda     │         │  - Búsqueda     │         │  - Búsqueda     │
+│    local        │         │    local        │         │    local        │
+│  - Heartbeats   │         │  - Heartbeats   │         │  - Heartbeats   │
+└─────────────────┘         └─────────────────┘         └─────────────────┘
+```
 
 ## Características Principales
 
 ### 🌐 Arquitectura Distribuida
+- **Roles Separados**: Coordinador (gestión) y Procesamiento (almacenamiento)
+- **CHORD DNS**: Resolución eficiente de nodos O(log N)
+- **Elección de Líder**: Algoritmo Bully para múltiples coordinadores
+- **Auto-registro**: Los nodos de procesamiento se registran automáticamente
 
-- **Diseño P2P Estructurado**: Organización en anillo mediante Consistent Hashing.
-- **Elección de Líder**: Algoritmo Bully para elegir automáticamente un nuevo coordinador si el actual falla.
-- **Descubrimiento Automático**: Los nodos se encuentran entre sí mediante **IP Cache Discovery** con escaneo de subred y propagación de peers.
+### 🛡️ Tolerancia a Fallos
+- **Replicación**: Factor configurable (default: 3 réplicas por archivo)
+- **Heartbeats**: Monitoreo continuo de salud de nodos
+- **Quorum**: Consistencia configurable (ONE, QUORUM, ALL)
+- **Docker Swarm**: Reinicio automático de servicios caídos
 
-### 🛡️ Fiabilidad y Tolerancia a Fallos
-
-- **Replicación de Datos**: Estrategia de replicación en cadena (Chain Replication) con factor configurable (default: 3).
-- **Heartbeat Monitoring**: Detección continua de la salud de los nodos.
-- **Auto-Curación**: Redistribución automática de datos cuando un nodo entra o sale del cluster.
-- **Quorum**: Consistencia garantizada en operaciones de lectura y escritura.
-
-### 🔍 Funcionalidades de Búsqueda
-
-- **Búsqueda Distribuida**: Las consultas se propagan eficientemente por el cluster.
-- **Indexación Automática**: Detección e indexación de archivos en tiempo real.
-- **Transferencia Resiliente**: Descarga de archivos desde cualquier réplica disponible.
+### 🔍 Funcionalidades
+- **Búsqueda Distribuida**: Consultas optimizadas usando índice de ubicaciones
+- **Indexación Automática**: Al iniciar, cada nodo indexa sus archivos locales
+- **Descarga Resiliente**: Obtener archivos desde cualquier réplica disponible
+- **Filtrado por Tipo**: Búsqueda por extensión de archivo
 
 ## Estructura del Proyecto
 
-```text
+```
 Distributed-Search-Engine/
 ├── src/
-│   ├── distributed/         # Lógica del sistema distribuido
-│   │   ├── coordination/    # Elección de líder (Bully)
-│   │   ├── consistency/     # Quorum y consistencia
-│   │   ├── discovery/       # IP Cache Discovery y Heartbeats
-│   │   ├── node/            # Implementación del Nodo P2P
-│   │   ├── replication/     # Consistent Hashing y Replication Manager
-│   │   └── search/          # Motor de búsqueda distribuido
-│   ├── server/              # Servidor TCP/RPC
-│   ├── client/              # Cliente interactivo y CLI
-│   ├── indexer/             # Indexación local de documentos
-│   ├── search/              # Motor de búsqueda local
-│   └── main_distributed.py  # Punto de entrada del nodo distribuido
-├── config/                  # Configuración JSON
-├── docs/                    # Documentación detallada
-├── shared_files/            # Directorio de archivos compartidos
-└── deploy-distributed.sh    # Script de despliegue
+│   ├── distributed/              # Sistema distribuido
+│   │   ├── node/                 # Nodos del sistema
+│   │   │   ├── coordinator_node.py   # Nodo coordinador
+│   │   │   └── processing_node.py    # Nodo de procesamiento
+│   │   ├── registry/             # Registro de nodos
+│   │   │   └── node_registry.py      # Gestión de nodos y archivos
+│   │   ├── dns/                  # Sistema de nombres
+│   │   │   └── chord_dns.py          # CHORD DNS para localización
+│   │   ├── consistency/          # Consistencia de datos
+│   │   │   └── quorum.py             # Protocolo de quorum
+│   │   ├── coordination/         # Coordinación multi-coordinador
+│   │   │   └── coordinator_cluster.py # Algoritmo Bully
+│   │   └── persistence/          # Persistencia de estado
+│   ├── server/                   # Servidor TCP base
+│   ├── client/                   # Clientes (GUI e interactivo)
+│   ├── indexer/                  # Indexación de documentos
+│   ├── search/                   # Motor de búsqueda local
+│   ├── transfer/                 # Transferencia de archivos
+│   ├── main_distributed.py       # Punto de entrada principal
+│   ├── main_coordinator.py       # Iniciar solo coordinador
+│   └── main_processing.py        # Iniciar solo procesamiento
+├── config/                       # Configuración JSON
+├── docs/                         # Documentación
+├── shared_files/                 # Archivos de prueba
+├── Dockerfile.distributed        # Imagen Docker unificada
+├── docker-compose.distributed.yml # Stack de Docker Swarm
+├── deploy-distributed.sh         # Script de despliegue
+└── docker-entrypoint.sh          # Entrypoint del contenedor
 ```
 
 ## Requisitos
 
 - Python 3.9+
-- Docker (opcional, para despliegue en contenedores)
-- Red TCP/IP estándar
+- Docker Engine 20.10+ (para despliegue con Swarm)
+- CustomTkinter (opcional, para GUI moderna)
 
 ## Instalación y Uso
 
-### 1. Instalación Local
+### Opción 1: Docker Swarm (Recomendado)
 
 ```bash
-# Clonar el repositorio
-git clone https://github.com/michellviu/Distributed-Search-Engine.git
-cd Distributed-Search-Engine
+# Desplegar cluster (1 coordinador + 3 nodos de procesamiento)
+./deploy-distributed.sh
 
+# Escalar a más nodos
+docker service scale search_processing=5
+
+# Ver estado
+docker stack services search
+
+# Ver logs
+docker service logs -f search_coordinator
+```
+
+### Opción 2: Ejecución Local
+
+```bash
 # Instalar dependencias
 pip install -r requirements.txt
+
+# Terminal 1: Iniciar coordinador
+python -m src.main_distributed --role coordinator --port 5000
+
+# Terminal 2: Iniciar nodo de procesamiento
+python -m src.main_distributed --role processing --port 5001 \
+    --coordinator-host localhost --coordinator-port 5000
+
+# Terminal 3: Otro nodo de procesamiento
+python -m src.main_distributed --role processing --port 5002 \
+    --coordinator-host localhost --coordinator-port 5000
 ```
 
-### 2. Despliegue Rápido (Docker Swarm)
-
-La forma más fácil de probar el sistema distribuido es usando el stack de Docker incluido:
+### Uso del Cliente GUI
 
 ```bash
-# Iniciar el cluster (3 nodos por defecto)
-./deploy-swarm.sh
+# Instalar CustomTkinter (opcional, para interfaz moderna)
+pip install customtkinter
+
+# Ejecutar GUI
+python -m src.client.client_gui
+
+# O usar el script
+./start_client_gui.sh
 ```
 
-### 3. Ejecución Manual de Nodos
+## Componentes del Sistema
 
-Puedes levantar múltiples nodos en diferentes terminales:
+### 1. CoordinatorNode (`src/distributed/node/coordinator_node.py`)
+- Mantiene registro de nodos de procesamiento
+- Índice centralizado de ubicación de archivos
+- Monitoreo de salud via heartbeats
+- Coordina búsquedas distribuidas (optimizadas)
+- Asigna almacenamiento por balanceo de carga
+- **NO almacena datos**
 
-```bash
-# Nodo 1 (Seed)
-python3 src/main_distributed.py --node-id node1 --port 5000
+### 2. ProcessingNode (`src/distributed/node/processing_node.py`)
+- Almacena archivos indexados localmente
+- Ejecuta búsquedas en su índice local
+- Envía heartbeats periódicos al coordinador
+- Se auto-registra al iniciar
+- **SÍ almacena datos**
 
-# Nodo 2 (se une al cluster)
-python3 src/main_distributed.py --node-id node2 --port 5001
+### 3. NodeRegistry (`src/distributed/registry/node_registry.py`)
+- Mapeo ID → (IP, Puerto) de nodos
+- Índice inverso: archivo → lista de nodos
+- Asignación por balanceo de carga
 
-# Nodo 3
-python3 src/main_distributed.py --node-id node3 --port 5002
+### 4. ChordDNS (`src/distributed/dns/chord_dns.py`)
+- Resolución de nombres basada en CHORD
+- Nodos virtuales para distribución uniforme
+- Finger table para búsquedas O(log N)
+
+### 5. QuorumManager (`src/distributed/consistency/quorum.py`)
+- Niveles: ONE, QUORUM, ALL
+- Control de versiones de archivos
+- Escrituras/lecturas consistentes
+
+### 6. CoordinatorCluster (`src/distributed/coordination/coordinator_cluster.py`)
+- Soporte para múltiples coordinadores
+- Algoritmo Bully para elección de líder
+- Replicación de estado entre coordinadores
+
+## Protocolo de Comunicación
+
+Todas las comunicaciones usan TCP con formato:
+```
+[8 bytes: longitud del mensaje][JSON payload]
 ```
 
-### 4. Uso del Cliente
-
-El cliente puede conectarse a cualquier nodo del cluster:
-
-```bash
-# Iniciar cliente interactivo
-python3 src/client/client_interactive.py --host localhost --port 5000
-```
-
-Comandos disponibles:
-
-- `search <query>`: Buscar en todo el cluster.
-- `upload <archivo>`: Subir e indexar un archivo (se replicará automáticamente).
-- `download <archivo>`: Descargar un archivo.
-- `cluster_status`: Ver estado de nodos, líder y replicación.
-
-## Arquitectura Técnica
-
-### Comunicación
-
-- **TCP (JSON-RPC):** Para operaciones críticas (búsqueda, indexación, replicación).
-- **TCP (IP Cache):** Para descubrimiento automático de nodos mediante escaneo de subred y registro bidireccional.
-
-### Distribución de Datos
-
-El sistema utiliza **Consistent Hashing** para asignar archivos a nodos.
-
-1. Se calcula `hash(nombre_archivo)`.
-2. El archivo se asigna al nodo con `hash(nodo) >= hash(archivo)`.
-3. Se crean réplicas en los `N-1` nodos siguientes del anillo.
-
-### Tolerancia a Fallos
-
-- Si un nodo cae, el sistema lo detecta vía Heartbeat.
-- Si era el líder, se inicia una elección (Bully Algorithm).
-- Los datos perdidos se regeneran automáticamente desde las réplicas restantes para mantener el factor de replicación.
+### Acciones del Coordinador
+| Acción | Descripción |
+|--------|-------------|
+| `health` | Verificar estado del coordinador |
+| `cluster_status` | Estado completo del cluster |
+| `search` | Buscar archivos (query, file_type) |
+| `list` | Listar todos los archivos |
+| `store` | Almacenar nuevo archivo |
+| `download` | Descargar archivo |
+| `register_node` | Registrar nodo de procesamiento |
 
 ## Documentación Adicional
 
-- 📄 [**REPORT.md**](REPORT.md): Informe detallado de diseño y arquitectura.
-- 📖 [**QUICKSTART.md**](docs/QUICKSTART.md): Guía paso a paso para usuarios.
+- 📄 [REPORT.md](REPORT.md) - Informe técnico detallado
+- 🐳 [docs/DOCKER_SWARM_DEPLOY.md](docs/DOCKER_SWARM_DEPLOY.md) - Guía de Docker Swarm
+- 🖥️ [docs/GUI_CLIENT.md](docs/GUI_CLIENT.md) - Uso del cliente gráfico
 
-## Contribuidores
+## Licencia
 
-Desarrollado como proyecto final para el curso de Sistemas Distribuidos.
+Proyecto académico - Curso de Sistemas Distribuidos

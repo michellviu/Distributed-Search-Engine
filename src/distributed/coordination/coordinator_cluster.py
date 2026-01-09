@@ -145,10 +145,17 @@ class CoordinatorCluster:
         self.active = False
         self._election_in_progress = False
         
+        # Callback para reconciliación cuando se acepta nuevo líder
+        self._on_new_leader_callback = None
+        
         # Parsear peers iniciales
         if peer_addresses:
             for addr in peer_addresses:
                 self._add_peer_from_address(addr)
+    
+    def set_on_new_leader_callback(self, callback):
+        """Configura callback a llamar cuando se acepta un nuevo líder"""
+        self._on_new_leader_callback = callback
     
     def _add_peer_from_address(self, address: str):
         """Añade un peer desde una dirección 'host:port'"""
@@ -175,14 +182,29 @@ class CoordinatorCluster:
         # Cargar estado persistido si existe
         self._load_state()
         
+        # Descubrir IDs reales de los peers antes de iniciar elección
+        self._discover_peer_ids()
+        
         # Iniciar heartbeat a otros coordinadores
         threading.Thread(target=self._peer_heartbeat_loop, daemon=True).start()
         
         # Iniciar verificación de líder
         threading.Thread(target=self._leader_check_loop, daemon=True).start()
         
-        # Intentar elección inicial después de un delay
-        threading.Timer(2.0, self._start_election).start()
+        # Intentar elección inicial después de un delay para que los peers estén listos
+        threading.Timer(3.0, self._start_election).start()
+    
+    def _discover_peer_ids(self):
+        """Descubre los IDs reales de los peers haciendo un heartbeat inicial"""
+        self.logger.info(f"🔍 Descubriendo IDs reales de {len(self.peers)} peers...")
+        
+        for peer_id, peer in list(self.peers.items()):
+            try:
+                self._check_peer_health(peer)
+            except:
+                pass
+        
+        self.logger.info(f"🔍 Peers actuales: {list(self.peers.keys())}")
     
     def stop(self):
         """Detiene el cluster manager"""
@@ -299,7 +321,7 @@ class CoordinatorCluster:
                     peer.last_seen = time.time()
     
     def _check_peer_health(self, peer: CoordinatorPeer) -> bool:
-        """Verifica si un peer está vivo"""
+        """Verifica si un peer está vivo y actualiza su información"""
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.settimeout(3)
@@ -325,6 +347,17 @@ class CoordinatorCluster:
                     # Actualizar rol del peer
                     peer_role = response.get('role', 'FOLLOWER')
                     peer.role = CoordinatorRole(peer_role)
+                    
+                    # Actualizar el ID real del peer si es diferente
+                    real_id = response.get('coordinator_id')
+                    if real_id and real_id != peer.coordinator_id:
+                        self.logger.info(f"🔄 Actualizando ID del peer: {peer.coordinator_id} -> {real_id}")
+                        old_id = peer.coordinator_id
+                        peer.coordinator_id = real_id
+                        # Actualizar la referencia en el diccionario de peers
+                        if old_id in self.peers:
+                            del self.peers[old_id]
+                            self.peers[real_id] = peer
                     
                     return True
         except:
@@ -526,6 +559,8 @@ class CoordinatorCluster:
     
     def _accept_new_leader(self, leader_id: str, leader_host: str, leader_port: int):
         """Acepta un nuevo líder anunciado vía COORDINATOR"""
+        was_candidate_or_leader = self.role in (CoordinatorRole.CANDIDATE, CoordinatorRole.LEADER)
+        
         self.current_leader = leader_id
         self.role = CoordinatorRole.FOLLOWER
         self._election_in_progress = False
@@ -546,6 +581,15 @@ class CoordinatorCluster:
             self.peers[leader_id].last_seen = time.time()
         
         self.logger.info(f"👑 [BULLY] Nuevo líder aceptado: {leader_id}")
+        
+        # Llamar callback de reconciliación si estábamos desconectados
+        if was_candidate_or_leader and self._on_new_leader_callback:
+            self.logger.info(f"🔄 [BULLY] Solicitando reconciliación con nuevo líder...")
+            threading.Thread(
+                target=self._on_new_leader_callback,
+                args=(leader_id, leader_host, leader_port),
+                daemon=True
+            ).start()
     
     def _announce_leadership(self):
         """

@@ -2,25 +2,30 @@
 
 ## Descripción
 
+El cliente GUI proporciona una interfaz gráfica para interactuar con el sistema de búsqueda distribuida. Soporta dos modos:
+
+- **CustomTkinter**: Interfaz moderna y estilizada (requiere instalación)
+- **Tkinter estándar**: Interfaz básica incluida en Python
+
 ## Instalación
 
-### Opción 1: Con Interfaz Moderna (Recomendado)
+### Con Interfaz Moderna (Recomendado)
 
 ```bash
-# Instalar CustomTkinter para una interfaz más bonita
+# Instalar CustomTkinter
 pip install customtkinter
+
+# O instalar todas las dependencias de GUI
+pip install -r requirements-gui.txt
 ```
 
-### Opción 2: Usar Tkinter Estándar (Ya incluido en Python)
+### Sin Instalación Adicional
 
-```bash
-# No necesitas instalar nada, Tkinter viene con Python
-# La GUI detectará automáticamente que no tienes CustomTkinter
-```
+El cliente detecta automáticamente si CustomTkinter está disponible. Si no lo está, usa Tkinter estándar que viene incluido con Python.
 
 ## Uso
 
-### Script de Inicio Rápido
+### Inicio Rápido
 
 ```bash
 # Desde el directorio raíz del proyecto
@@ -30,198 +35,214 @@ pip install customtkinter
 ### Inicio Manual
 
 ```bash
-# Con configuración por defecto
-python3 src/client/client_gui.py
+# Ejecutar como módulo (recomendado)
+python -m src.client.client_gui
 
-# Con configuración personalizada
-python3 src/client/client_gui.py --config mi_config.json --host 192.168.1.100 --port 5000
+# Con parámetros personalizados
+python -m src.client.client_gui --host localhost --port 5000
+
+# Especificar múltiples coordinadores
+python -m src.client.client_gui --coordinators "localhost:5000,192.168.1.100:5000"
 ```
 
-### Si instalaste el paquete
+### Variables de Entorno
 
 ```bash
-# Puedes agregar el GUI como entry point en setup.py
-search-client-gui
+# Configurar coordinadores via variable de entorno
+export COORDINATOR_ADDRESSES="localhost:5000,backup:5000"
+python -m src.client.client_gui
 ```
 
 ## Interfaz de Usuario
 
-La GUI incluye las siguientes secciones:
+### Panel Principal
 
-### 1. **Barra de Búsqueda**
+```
+┌────────────────────────────────────────────────────────────┐
+│  🔍 Distributed Search Engine                              │
+├────────────────────────────────────────────────────────────┤
+│                                                            │
+│  Búsqueda: [________________________] Tipo: [.txt ▼]       │
+│                                                            │
+│  [🔍 Buscar]  [📋 Listar Todo]  [🔄 Reconectar]            │
+│                                                            │
+├────────────────────────────────────────────────────────────┤
+│  Resultados:                                               │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │ 📄 documento.txt - Score: 0.95 - 2.3 KB              │  │
+│  │ 📄 readme.md - Score: 0.87 - 1.1 KB                  │  │
+│  │ 📄 config.json - Score: 0.72 - 0.5 KB                │  │
+│  └──────────────────────────────────────────────────────┘  │
+│                                                            │
+├────────────────────────────────────────────────────────────┤
+│  Acciones:                                                 │
+│  [📥 Descargar Seleccionado]  [📤 Indexar Archivo]         │
+│                                                            │
+├────────────────────────────────────────────────────────────┤
+│  Log:                                                      │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │ [INFO] Conectado a localhost:5000                    │  │
+│  │ [OK] Búsqueda completada: 3 resultados               │  │
+│  └──────────────────────────────────────────────────────┘  │
+└────────────────────────────────────────────────────────────┘
+```
 
-- Campo de búsqueda con filtro por tipo de archivo
-- Botón "Buscar" (o presiona Enter)
-- Botón "Listar Todo" para ver todos los archivos
+### Funcionalidades
 
-### 2. **Panel de Resultados**
+#### 1. Búsqueda
 
-- Muestra resultados con:
-- Nombre del archivo
+- **Campo de búsqueda**: Ingresa términos a buscar
+- **Filtro de tipo**: Selecciona extensión (.txt, .md, .py, etc.)
+- **Búsqueda vacía + tipo**: Lista todos los archivos de ese tipo
+- **Presiona Enter** o clic en "Buscar"
+
+#### 2. Listar Todo
+
+- Muestra todos los archivos indexados en el cluster
+- No requiere parámetros de búsqueda
+
+#### 3. Descargar
+
+1. Selecciona un archivo de los resultados
+2. Clic en "Descargar Seleccionado"
+3. Elige el directorio de destino
+4. El archivo se descarga desde cualquier réplica disponible
+
+#### 4. Indexar Archivo
+
+1. Clic en "Indexar Archivo"
+2. Selecciona el archivo a subir
+3. El archivo se distribuye automáticamente a N nodos (factor de replicación)
+
+#### 5. Reconectar
+
+- Intenta reconectar al coordinador si se perdió la conexión
+- Útil después de reiniciar el cluster
+
+### Panel de Resultados
+
+Cada resultado muestra:
+- 📄 Nombre del archivo
 - Ruta completa
-- Score de relevancia
+- Score de relevancia (0.0 - 1.0)
 - Tamaño en KB
 - Tipo de archivo
 
-### 3. **Acciones**
+### Panel de Log
 
-- **Descargar**: Ingresa nombre y elige directorio
-- **Indexar Archivo**: Abre diálogo para seleccionar archivo
-- **Reconectar**: Intenta reconectar si se perdió la conexión
+Registro de todas las operaciones con código de colores:
+- 🟢 Verde: Operación exitosa
+- 🔴 Rojo: Error
+- ⚪ Blanco: Información
 
-### 4. **Registro (Log)**
+## Configuración
 
-- Muestra todas las operaciones realizadas
-- Código de colores: Verde (éxito), Rojo (error), Blanco (info)
+### Archivo de Configuración
 
-## Ejemplo de Uso
+El cliente busca configuración en `config/client_config.json`:
 
-1. **Iniciar el servidor** (en otra terminal):
-
-   ```bash
-   ./start_server.sh
-   ```
-
-2. **Iniciar el cliente GUI**:
-
-   ```bash
-   ./start_client_gui.sh
-   ```
-
-3. **Usar la interfaz**:
-   - Escribe "python" en el campo de búsqueda
-   - (Opcional) Especifica ".txt" en el filtro de tipo
-   - Haz clic en "Buscar" o presiona Enter
-   - Selecciona un archivo de los resultados
-   - Copia el nombre y pégalo en "Descargar archivo"
-   - Haz clic en "Descargar" y elige el directorio
-
-### ✅ Mismo Cliente para Múltiples Nodos
-
-```python
-# Fácil de adaptar para conectar a múltiples servidores
-servers = [
-    ('node1.example.com', 5000),
-    ('node2.example.com', 5000),
-    ('node3.example.com', 5000)
-]
-
-# El GUI puede mostrar un selector de nodos
+```json
+{
+  "distributed": {
+    "coordinators": ["localhost:5000"]
+  },
+  "host": "localhost",
+  "port": 5000,
+  "download_path": "./downloads"
+}
 ```
 
-### ✅ Monitoreo Visual
+### Prioridad de Configuración
 
-- Ver estado de conexión con cada nodo
-- Progreso de descarga desde múltiples fuentes
-- Estadísticas de red en tiempo real
+1. Argumentos de línea de comandos (`--host`, `--port`)
+2. Variables de entorno (`COORDINATOR_ADDRESSES`)
+3. Archivo de configuración
+4. Valores por defecto (localhost:5000)
 
-## Personalización
+## Múltiples Coordinadores
 
-### Temas
-
-```python
-# En client_gui.py, línea ~49
-ctk.set_appearance_mode("dark")  # "System", "Dark", "Light"
-ctk.set_default_color_theme("blue")  # "blue", "green", "dark-blue"
-```
-
-### Colores
-
-```python
-# Personalizar colores de CustomTkinter
-ctk.set_default_color_theme("custom_theme.json")
-```
-
-### Tamaño de Ventana
-
-```python
-# En client_gui.py, línea ~57
-self.root.geometry("1000x700")  # Cambiar dimensiones
-```
-
-## Troubleshooting
-
-### La GUI no inicia
-
-**Problema**: `No module named 'tkinter'`
-
-**Solución (Ubuntu/Debian)**:
+El cliente soporta failover automático entre coordinadores:
 
 ```bash
-sudo apt-get install python3-tk
+# Especificar múltiples coordinadores
+python -m src.client.client_gui --coordinators "coord1:5000,coord2:5000,coord3:5000"
 ```
 
-**Solución (Fedora/RHEL)**:
+El cliente:
+1. Intenta conectar al primer coordinador
+2. Si falla, intenta el siguiente
+3. Mantiene health checks periódicos
+4. Reconecta automáticamente si el coordinador actual cae
+
+## Ejemplos de Uso
+
+### Búsqueda Simple
+
+1. Escribe "python" en el campo de búsqueda
+2. Clic en "Buscar"
+3. Ver resultados que contienen "python"
+
+### Filtrar por Tipo
+
+1. Deja el campo de búsqueda vacío
+2. Selecciona ".md" en el filtro de tipo
+3. Clic en "Buscar"
+4. Ver todos los archivos Markdown
+
+### Búsqueda Combinada
+
+1. Escribe "readme" en el campo de búsqueda
+2. Selecciona ".md" en el filtro de tipo
+3. Clic en "Buscar"
+4. Ver archivos Markdown que contienen "readme"
+
+### Descargar Archivo
+
+1. Realiza una búsqueda
+2. Selecciona un archivo haciendo clic en él
+3. Clic en "Descargar Seleccionado"
+4. Elige carpeta de destino
+5. El archivo se guarda localmente
+
+### Subir Nuevo Archivo
+
+1. Clic en "Indexar Archivo"
+2. Selecciona un archivo de tu sistema
+3. El archivo se sube y replica automáticamente
+4. Aparecerá en futuras búsquedas
+
+## Solución de Problemas
+
+### "No se puede conectar al coordinador"
 
 ```bash
-sudo dnf install python3-tkinter
+# Verificar que el coordinador esté activo
+docker service ls | grep coordinator
+
+# Verificar puerto
+nc -z localhost 5000
 ```
 
-### CustomTkinter no funciona
-
-**Opción 1**: Actualizar
+### "CustomTkinter no disponible"
 
 ```bash
-pip install --upgrade customtkinter
+# Instalar CustomTkinter
+pip install customtkinter
+
+# O crear entorno virtual
+python -m venv venv
+source venv/bin/activate
+pip install customtkinter
 ```
-
-**Opción 2**: Usar Tkinter estándar
-
-- El código detecta automáticamente y usa Tkinter si CustomTkinter no está disponible
 
 ### La GUI se congela
 
-- **Causa**: Operación de red bloqueando el thread principal
-- **Solución**: Ya implementado - todas las operaciones de red corren en threads separados
+- Las operaciones de red se ejecutan en threads separados
+- Si hay problemas de red, puede haber un timeout (5 segundos)
+- Usar "Reconectar" para restablecer conexión
 
-### No se conecta al servidor
+### Archivo no aparece después de indexar
 
-1. Verifica que el servidor esté corriendo:
-
-   ```bash
-   tail -f logs/server.log
-   ```
-
-2. Usa el botón "Reconectar" en la GUI
-
-3. Verifica host y puerto en `config/client_config.json`
-
-## Próximos Pasos para Versión Distribuida
-
-1. **Selector de Nodos**:
-
-   ```python
-   # Agregar dropdown para elegir servidor
-   self.server_selector = ctk.CTkComboBox(
-       frame,
-       values=["node1:5000", "node2:5000", "node3:5000"]
-   )
-   ```
-
-2. **Búsqueda en Múltiples Nodos**:
-
-   ```python
-   # Lanzar búsquedas paralelas
-   results = []
-   threads = []
-   for server in servers:
-       t = threading.Thread(target=search_node, args=(server,))
-       threads.append(t)
-       t.start()
-   ```
-
-3. **Progress Bars**:
-
-   ```python
-   # Mostrar progreso de descarga
-   self.progress_bar = ctk.CTkProgressBar(frame)
-   self.progress_bar.pack()
-   ```
-
-4. **Gráficas de Red**:
-
-   ```python
-   # Instalar matplotlib para gráficas
-   pip install matplotlib
-   # Mostrar estadísticas visuales
-   ```
+1. Esperar unos segundos (propagación)
+2. Usar "Listar Todo" para refrescar
+3. Verificar logs del coordinador

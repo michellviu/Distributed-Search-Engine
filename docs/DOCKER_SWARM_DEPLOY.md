@@ -5,7 +5,6 @@ Esta guía explica cómo desplegar el sistema distribuido de búsqueda usando Do
 ## Prerrequisitos
 
 - Docker Engine 20.10+
-- Docker Compose v2
 - Al menos 2GB de RAM disponible
 
 ## Despliegue Rápido
@@ -46,7 +45,7 @@ docker stack services search
 │                                                              │
 │   ┌─────────────────┐                                        │
 │   │   Coordinator   │ ◄── Puerto 5000 expuesto               │
-│   │   (coordinator) │                                        │
+│   │   (1 réplica)   │                                        │
 │   └────────┬────────┘                                        │
 │            │                                                 │
 │            ▼                                                 │
@@ -64,164 +63,196 @@ docker stack services search
 └─────────────────────────────────────────────────────────────┘
 ```
 
+## Archivos de Configuración
+
+### docker-compose.distributed.yml
+
+Define el stack completo:
+- **Servicio `coordinator`**: 1 réplica, puerto 5000 expuesto
+- **Servicio `processing`**: 3+ réplicas, escalable dinámicamente
+- **Red `search-network`**: Overlay network para comunicación interna
+
+### Dockerfile.distributed
+
+Imagen única que soporta ambos roles:
+- Variable `NODE_ROLE` determina el comportamiento
+- Incluye todas las dependencias necesarias
+
+### docker-entrypoint.sh
+
+Script de entrada que:
+1. Genera ID único basado en hostname del contenedor
+2. Espera a que el coordinador esté disponible (nodos de procesamiento)
+3. Copia archivos iniciales al directorio de trabajo
+4. Inicia el rol correspondiente
+
 ## Volúmenes
 
-- `shared-files`: Archivos compartidos para indexar
-- `coordinator-logs`: Logs del coordinador
-- `processing-logs`: Logs de nodos de procesamiento
-- `processing-data-N`: Datos de cada nodo de procesamiento
+| Volumen | Descripción | Acceso |
+|---------|-------------|--------|
+| `shared-files` | Archivos iniciales para indexar | Solo lectura |
+| `processing-data` | Datos de cada nodo de procesamiento | Lectura/Escritura |
+| `coordinator-logs` | Logs del coordinador | Lectura/Escritura |
+| `processing-logs` | Logs de nodos de procesamiento | Lectura/Escritura |
 
-## Pruebas
+## Variables de Entorno
 
-### Ejecutar suite de pruebas
+### Coordinador
 
-```bash
-./test-distributed.sh
-```
+| Variable | Valor | Descripción |
+|----------|-------|-------------|
+| `NODE_ROLE` | `coordinator` | Rol del nodo |
+| `NODE_ID` | `coordinator-1` | ID único |
+| `NODE_PORT` | `5000` | Puerto TCP |
 
-### Modo interactivo (para probar fallos)
+### Procesamiento
 
-```bash
-./test-failover-interactive.sh
-```
-
-Este modo permite:
-- Ver estado del cluster en tiempo real
-- Escalar nodos dinámicamente
-- Simular caída de nodos
-- Probar búsquedas manualmente
-- Ver logs en tiempo real
+| Variable | Valor | Descripción |
+|----------|-------|-------------|
+| `NODE_ROLE` | `processing` | Rol del nodo |
+| `COORDINATOR_HOST` | `coordinator` | Hostname del coordinador |
+| `COORDINATOR_PORT` | `5000` | Puerto del coordinador |
+| `INDEX_PATH` | `/home/app/data` | Directorio de archivos |
+| `AUTO_INDEX` | `true` | Indexar automáticamente al iniciar |
 
 ## Comandos Útiles
 
-### Ver estado de servicios
+### Gestión del Stack
 
 ```bash
+# Ver servicios
 docker stack services search
-```
 
-### Ver logs del coordinador
+# Ver tareas (contenedores)
+docker stack ps search
 
-```bash
-docker service logs -f search_coordinator
-```
-
-### Ver logs de procesamiento
-
-```bash
-docker service logs -f search_processing
-```
-
-### Escalar nodos de procesamiento
-
-```bash
-# Escalar a 5 nodos
+# Escalar nodos de procesamiento
 docker service scale search_processing=5
 
-# Reducir a 2 nodos
-docker service scale search_processing=2
-```
-
-### Simular caída de un nodo
-
-```bash
-# Obtener ID de un contenedor
-docker ps --filter "name=search_processing"
-
-# Matar el contenedor (Swarm lo reiniciará automáticamente)
-docker kill <container_id>
-```
-
-### Eliminar el despliegue
-
-```bash
+# Eliminar stack
 docker stack rm search
 ```
 
-## Verificar Funcionalidad
-
-### 1. Health Check
+### Logs
 
 ```bash
-echo '{"action": "health"}' | nc localhost 5000
+# Logs del coordinador
+docker service logs -f search_coordinator
+
+# Logs de procesamiento
+docker service logs -f search_processing
+
+# Logs de un contenedor específico
+docker logs -f <container_id>
 ```
 
-### 2. Estado del Cluster
+### Debugging
 
 ```bash
-echo '{"action": "cluster_status"}' | nc localhost 5000
+# Entrar a un contenedor
+docker exec -it <container_id> bash
+
+# Ver red
+docker network ls
+docker network inspect search_search-network
+
+# Ver volúmenes
+docker volume ls
 ```
 
-### 3. Listar Archivos
+## Pruebas del Sistema
+
+### Verificar Estado del Cluster
 
 ```bash
-echo '{"action": "list"}' | nc localhost 5000
+# Usando Python
+python3 -c "
+import socket
+import json
+
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+    s.connect(('localhost', 5000))
+    request = json.dumps({'action': 'cluster_status'})
+    s.sendall(f'{len(request):<8}'.encode() + request.encode())
+    length = int(s.recv(8).decode().strip())
+    response = json.loads(s.recv(length).decode())
+    print(json.dumps(response, indent=2))
+"
 ```
 
-### 4. Buscar Archivos
+### Probar Búsqueda
 
 ```bash
-echo '{"action": "search", "query": "test"}' | nc localhost 5000
-```
+python3 -c "
+import socket
+import json
 
-## Usar la GUI
-
-```bash
-# Desde fuera de Docker
-python -m src.client.client_gui --coordinators localhost:5000
-
-# O con múltiples coordinadores para failover
-python -m src.client.client_gui --coordinators coord1:5000 coord2:5001 coord3:5002
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+    s.connect(('localhost', 5000))
+    request = json.dumps({'action': 'search', 'query': 'test', 'file_type': '.txt'})
+    s.sendall(f'{len(request):<8}'.encode() + request.encode())
+    length = int(s.recv(8).decode().strip())
+    response = json.loads(s.recv(length).decode())
+    print(f'Resultados: {len(response.get(\"results\", []))}')
+"
 ```
 
 ## Tolerancia a Fallos
 
-### Caída de nodo de procesamiento
-
-1. Docker Swarm detecta el fallo
-2. Reinicia automáticamente el contenedor
-3. El nodo se re-registra con el coordinador
-4. Los archivos se re-replican si es necesario
-
-### Caída del coordinador
-
-1. Docker Swarm detecta el fallo
-2. Reinicia automáticamente el contenedor
-3. Los nodos de procesamiento se reconectan
-
-### Pérdida de datos
-
-- Con factor de replicación 3, el sistema tolera la pérdida de 2 nodos
-- Los archivos se re-replican automáticamente cuando hay nodos disponibles
-
-## Troubleshooting
-
-### El coordinador no inicia
+### Nodo de Procesamiento Cae
 
 ```bash
-# Ver logs de error
-docker service logs search_coordinator
+# Simular caída de un nodo
+docker kill $(docker ps -q --filter "name=search_processing" | head -1)
 
-# Verificar que el puerto no está en uso
-netstat -tlnp | grep 5000
+# Docker Swarm reiniciará automáticamente el nodo
+# Los datos siguen disponibles en las réplicas
 ```
 
-### Los nodos de procesamiento no se conectan
+### Coordinador Cae
 
 ```bash
-# Verificar red overlay
-docker network ls | grep search
+# Simular caída del coordinador
+docker kill $(docker ps -q --filter "name=search_coordinator")
 
-# Verificar DNS interno
-docker run --rm --network search_search-network alpine nslookup coordinator
+# Docker Swarm reinicia automáticamente
+# Los nodos de procesamiento se re-registran
 ```
 
-### Los archivos no se indexan
+## Solución de Problemas
+
+### Los nodos no se registran
+
+1. Verificar que el coordinador esté activo:
+   ```bash
+   docker service logs search_coordinator
+   ```
+
+2. Verificar conectividad de red:
+   ```bash
+   docker exec -it <processing_container> nc -z coordinator 5000
+   ```
+
+### Archivos no aparecen
+
+1. Verificar que los archivos se copiaron:
+   ```bash
+   docker exec -it <processing_container> ls -la /home/app/data
+   ```
+
+2. Verificar logs de indexación:
+   ```bash
+   docker service logs search_processing | grep -i index
+   ```
+
+### Puerto 5000 ocupado
 
 ```bash
-# Verificar volumen de archivos compartidos
-docker volume inspect shared-files
+# Verificar qué está usando el puerto
+sudo lsof -i :5000
 
-# Verificar contenido del volumen
-docker run --rm -v shared-files:/data alpine ls -la /data
+# Eliminar stack anterior
+docker stack rm search
+sleep 10
+./deploy-distributed.sh
 ```

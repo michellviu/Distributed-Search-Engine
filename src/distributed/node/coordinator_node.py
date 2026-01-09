@@ -33,6 +33,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from distributed.registry.node_registry import NodeRegistry, NodeInfo
 from distributed.dns.chord_dns import ChordDNS
 from distributed.consistency.quorum import QuorumManager, QuorumLevel, WriteResult
+from distributed.coordination.coordinator_cluster import CoordinatorCluster, CoordinatorRole
 
 
 class CoordinatorNode:
@@ -66,7 +67,8 @@ class CoordinatorNode:
                  coordinator_id: str,
                  host: str,
                  port: int,
-                 announce_host: str = None):
+                 announce_host: str = None,
+                 peer_coordinators: List[str] = None):
         """
         Inicializa el nodo coordinador.
         
@@ -75,11 +77,13 @@ class CoordinatorNode:
             host: IP para bind (0.0.0.0 para todas las interfaces)
             port: Puerto TCP
             announce_host: IP para anunciarse a otros nodos
+            peer_coordinators: Lista de otros coordinadores ["host:port", ...]
         """
         self.coordinator_id = coordinator_id
         self.host = host
         self.port = port
         self.announce_host = announce_host or host
+        self.peer_coordinators = peer_coordinators or []
         
         self.logger = logging.getLogger(f"Coordinator-{coordinator_id}")
         
@@ -94,6 +98,17 @@ class CoordinatorNode:
             coordinator_id, 
             default_level=self.QUORUM_LEVEL
         )
+        
+        # Cluster de coordinadores con algoritmo BULLY
+        self.cluster = CoordinatorCluster(
+            coordinator_id=coordinator_id,
+            host=announce_host or host,
+            port=port,
+            peer_addresses=peer_coordinators
+        )
+        
+        # Configurar callback para reconciliación cuando cambia el líder
+        self.cluster.set_on_new_leader_callback(self._on_new_leader_elected)
         
         # Event loop para operaciones async
         self._loop = None
@@ -126,6 +141,7 @@ class CoordinatorNode:
         self.logger.info(f"   Host:        {self.host}:{self.port}")
         self.logger.info(f"   Announce:    {self.announce_host}:{self.port}")
         self.logger.info(f"   Quorum:      {self.QUORUM_LEVEL.value}")
+        self.logger.info(f"   Peers:       {len(self.peer_coordinators)} coordinadores")
         self.logger.info("=" * 60)
         
         # 0. Iniciar event loop para async
@@ -143,6 +159,16 @@ class CoordinatorNode:
         # 3. Iniciar verificación de replicación
         threading.Thread(target=self._replication_check_loop, daemon=True).start()
         self.logger.info("✅ Verificador de replicación iniciado")
+        
+        # 4. Iniciar cluster de coordinadores (algoritmo Bully)
+        if self.peer_coordinators:
+            self.cluster.start()
+            self.logger.info("✅ Cluster de coordinadores iniciado (Bully)")
+        else:
+            # Si no hay peers, somos el líder por defecto
+            self.cluster.role = CoordinatorRole.LEADER
+            self.cluster.current_leader = self.coordinator_id
+            self.logger.info("✅ Único coordinador - asumiendo liderazgo")
         
         self.logger.info("🎯 Coordinador listo para recibir conexiones")
         
@@ -169,6 +195,10 @@ class CoordinatorNode:
         """Detiene el nodo coordinador"""
         self.logger.info("🛑 Deteniendo coordinador...")
         self.active = False
+        
+        # Detener cluster de coordinadores
+        if self.cluster.active:
+            self.cluster.stop()
         
         if self._loop:
             self._loop.call_soon_threadsafe(self._loop.stop)
@@ -313,7 +343,9 @@ class CoordinatorNode:
             return {
                 'status': 'ok', 
                 'node_type': 'coordinator',
-                'is_leader': True,  # TODO: integrar con CoordinatorCluster
+                'is_leader': self.cluster.is_leader(),
+                'role': self.cluster.role.value,
+                'current_leader': self.cluster.current_leader,
                 'coordinator_id': self.coordinator_id
             }
         
@@ -325,6 +357,22 @@ class CoordinatorNode:
         
         elif action == 'download':
             return self._handle_download(request)
+        
+        elif action == 'request_file_assignment':
+            return self._handle_request_file_assignment(request)
+        
+        # === Mensajes del algoritmo BULLY ===
+        elif action == 'bully_message':
+            return self._handle_bully_message(request)
+        
+        elif action == 'coordinator_heartbeat':
+            return self._handle_coordinator_heartbeat(request)
+        
+        elif action == 'replicate_state':
+            return self._handle_replicate_state(request)
+        
+        elif action == 'request_reconciliation':
+            return self._handle_reconciliation_request(request)
         
         else:
             return {'status': 'error', 'message': f'Unknown action: {action}'}
@@ -377,6 +425,372 @@ class CoordinatorNode:
             'message': 'Heartbeat received' if updated else 'Node not registered'
         }
     
+    def _handle_request_file_assignment(self, request: dict) -> dict:
+        """
+        Asigna archivos a un nodo de procesamiento para indexación inicial.
+        
+        Implementa balanceo de carga para la indexación inicial:
+        - Archivos nuevos: asigna usando hash consistente del nombre
+        - Archivos existentes: solo asigna si faltan réplicas Y este nodo 
+          es el mejor candidato (menor carga)
+        
+        Esto evita que todos los nodos indexen todos los archivos cuando
+        comparten el mismo volumen de almacenamiento.
+        """
+        node_id = request.get('node_id')
+        available_files = request.get('available_files', [])
+        host = request.get('host')
+        port = request.get('port', 5000)
+        
+        if not node_id or not host:
+            return {'status': 'error', 'message': 'Missing node_id or host'}
+        
+        # Registrar el nodo primero si no está registrado
+        self.registry.register_node(node_id, host, port)
+        self.dns.register_node(node_id, host, port)
+        
+        # Determinar qué archivos asignar a este nodo
+        assigned_files = []
+        
+        with self._lock:
+            # Obtener número de nodos activos (incluyendo este)
+            active_nodes = list(self.registry.get_active_nodes())
+            num_nodes = len(active_nodes)
+            
+            if num_nodes == 0:
+                num_nodes = 1
+            
+            # Encontrar el índice de este nodo en la lista ordenada
+            node_ids_sorted = sorted([n.node_id for n in active_nodes])
+            if node_id not in node_ids_sorted:
+                node_ids_sorted.append(node_id)
+                node_ids_sorted.sort()
+            
+            node_index = node_ids_sorted.index(node_id)
+            num_total_nodes = len(node_ids_sorted)
+            
+            for file_name in available_files:
+                # Verificar si el archivo ya está registrado
+                existing_locations = self.registry.get_file_locations(file_name)
+                current_replicas = len(existing_locations)
+                
+                # Calcular cuántas réplicas se necesitan (máximo replication_factor o num_nodes)
+                target_replicas = min(self.REPLICATION_FACTOR, num_total_nodes)
+                
+                if current_replicas >= target_replicas:
+                    # Ya hay suficientes réplicas, no asignar
+                    continue
+                
+                if not existing_locations:
+                    # Archivo nuevo: usar hash consistente para decidir
+                    file_hash = hash(file_name) % num_total_nodes
+                    
+                    # Este nodo debe tener el archivo si está en las primeras 'target_replicas' posiciones
+                    target_indices = [(file_hash + i) % num_total_nodes for i in range(target_replicas)]
+                    
+                    if node_index in target_indices:
+                        assigned_files.append(file_name)
+                else:
+                    # Archivo existente pero faltan réplicas
+                    if node_id not in existing_locations:
+                        # Solo asignar si este nodo es el mejor candidato
+                        # (primero en el orden de hash que no tiene el archivo)
+                        file_hash = hash(file_name) % num_total_nodes
+                        
+                        # Buscar el siguiente nodo que debería tener el archivo
+                        for i in range(num_total_nodes):
+                            candidate_idx = (file_hash + i) % num_total_nodes
+                            candidate_id = node_ids_sorted[candidate_idx]
+                            
+                            if candidate_id not in existing_locations:
+                                # Este es el siguiente nodo que debería tener el archivo
+                                if candidate_id == node_id:
+                                    assigned_files.append(file_name)
+                                break  # Solo asignar a un nodo por iteración
+        
+        self.logger.info(
+            f"📋 Asignación de archivos para {node_id}: "
+            f"{len(assigned_files)}/{len(available_files)} archivos"
+        )
+        
+        return {
+            'status': 'success',
+            'node_id': node_id,
+            'assigned_files': assigned_files,
+            'total_available': len(available_files),
+            'total_assigned': len(assigned_files)
+        }
+    
+    # =========================================================================
+    # HANDLERS PARA ALGORITMO BULLY Y COORDINACIÓN DE CLUSTER
+    # =========================================================================
+    
+    def _handle_bully_message(self, request: dict) -> dict:
+        """
+        Procesa mensajes del algoritmo Bully para elección de líder.
+        
+        Tipos de mensaje:
+        - ELECTION: Un nodo inicia elección (responder OK si tenemos mayor ID)
+        - COORDINATOR: Un nodo anuncia que es el nuevo líder
+        """
+        message_type = request.get('message_type')
+        from_id = request.get('from_coordinator')
+        from_host = request.get('from_host')
+        from_port = request.get('from_port', 5000)
+        
+        self.logger.info(f"🗳️ Mensaje Bully recibido: {message_type} de {from_id}")
+        
+        return self.cluster.handle_bully_message(
+            message_type=message_type,
+            from_id=from_id,
+            from_host=from_host,
+            from_port=from_port
+        )
+    
+    def _handle_coordinator_heartbeat(self, request: dict) -> dict:
+        """
+        Procesa heartbeat de otro coordinador.
+        Usado para detectar si el líder sigue vivo.
+        """
+        from_id = request.get('from_coordinator')
+        role = request.get('role', 'FOLLOWER')
+        
+        self.logger.debug(f"💓 Heartbeat de coordinador: {from_id} ({role})")
+        
+        return {
+            'status': 'ok',
+            'coordinator_id': self.coordinator_id,
+            'role': self.cluster.role.value,
+            'is_leader': self.cluster.is_leader()
+        }
+    
+    def _handle_replicate_state(self, request: dict) -> dict:
+        """
+        Recibe estado replicado del líder.
+        Solo los followers reciben este mensaje.
+        """
+        from_id = request.get('from_coordinator')
+        state_data = request.get('state')
+        
+        if not state_data:
+            return {'status': 'error', 'message': 'No state data'}
+        
+        # Aplicar el estado recibido
+        applied = self.cluster.handle_state_replication(from_id, state_data)
+        
+        if applied:
+            # Sincronizar también el registry local con el estado del líder
+            if 'nodes' in state_data:
+                self.logger.info(f"📥 Sincronizando {len(state_data['nodes'])} nodos del líder")
+            if 'file_locations' in state_data:
+                self.logger.info(f"📥 Sincronizando {len(state_data['file_locations'])} archivos del líder")
+        
+        return {
+            'status': 'ok' if applied else 'ignored',
+            'coordinator_id': self.coordinator_id
+        }
+    
+    def _handle_reconciliation_request(self, request: dict) -> dict:
+        """
+        Procesa una solicitud de reconciliación de otro coordinador.
+        
+        Usado cuando un coordinador se reconecta después de una partición de red.
+        El coordinador que se reconecta envía su estado y recibe el estado actual.
+        """
+        from_id = request.get('from_coordinator')
+        their_state = request.get('state', {})
+        
+        self.logger.info(f"🔄 Solicitud de reconciliación de {from_id}")
+        
+        # Obtener nuestro estado actual
+        our_state = {
+            'nodes': {nid: node.to_dict() for nid, node in self.registry.nodes.items()},
+            'file_locations': dict(self.registry.file_locations)
+        }
+        
+        # Realizar la reconciliación
+        reconciled = self._reconcile_states(their_state, our_state)
+        
+        return {
+            'status': 'ok',
+            'coordinator_id': self.coordinator_id,
+            'reconciled_state': reconciled,
+            'is_leader': self.cluster.is_leader()
+        }
+    
+    def _reconcile_states(self, their_state: dict, our_state: dict) -> dict:
+        """
+        Reconcilia dos estados de coordinadores después de una partición de red.
+        
+        Estrategia de reconciliación:
+        - Unir todos los nodos conocidos
+        - Unir todas las ubicaciones de archivos
+        - Resolver conflictos tomando la unión (más réplicas = más disponibilidad)
+        """
+        reconciled = {
+            'nodes': {},
+            'file_locations': {}
+        }
+        
+        # 1. Unir nodos de ambos estados
+        all_nodes = set()
+        if 'nodes' in their_state:
+            all_nodes.update(their_state['nodes'].keys())
+        if 'nodes' in our_state:
+            all_nodes.update(our_state['nodes'].keys())
+        
+        # Preferir nuestro estado si es más reciente
+        for node_id in all_nodes:
+            their_node = their_state.get('nodes', {}).get(node_id)
+            our_node = our_state.get('nodes', {}).get(node_id)
+            
+            if our_node and their_node:
+                # Tomar el más reciente
+                our_seen = our_node.get('last_seen', 0)
+                their_seen = their_node.get('last_seen', 0)
+                reconciled['nodes'][node_id] = our_node if our_seen >= their_seen else their_node
+            else:
+                reconciled['nodes'][node_id] = our_node or their_node
+        
+        # 2. Unir ubicaciones de archivos (tomar la UNIÓN)
+        all_files = set()
+        if 'file_locations' in their_state:
+            all_files.update(their_state['file_locations'].keys())
+        if 'file_locations' in our_state:
+            all_files.update(our_state['file_locations'].keys())
+        
+        for file_name in all_files:
+            their_locs = set(their_state.get('file_locations', {}).get(file_name, []))
+            our_locs = set(our_state.get('file_locations', {}).get(file_name, []))
+            
+            # Unión de ubicaciones (más réplicas = más disponibilidad)
+            reconciled['file_locations'][file_name] = list(their_locs | our_locs)
+        
+        self.logger.info(
+            f"🔄 Reconciliación: {len(reconciled['nodes'])} nodos, "
+            f"{len(reconciled['file_locations'])} archivos"
+        )
+        
+        # 3. Aplicar el estado reconciliado a nuestro registro
+        self._apply_reconciled_state(reconciled)
+        
+        return reconciled
+    
+    def _apply_reconciled_state(self, reconciled: dict):
+        """Aplica el estado reconciliado a nuestro registro local"""
+        # Aplicar nodos
+        for node_id, node_data in reconciled.get('nodes', {}).items():
+            if node_id not in self.registry.nodes:
+                self.registry.register_node(
+                    node_id,
+                    node_data.get('host', 'unknown'),
+                    node_data.get('port', 5001)
+                )
+        
+        # Aplicar ubicaciones de archivos
+        for file_name, locations in reconciled.get('file_locations', {}).items():
+            for node_id in locations:
+                self.registry.register_file_location(file_name, node_id)
+    
+    def _replicate_state_to_followers(self):
+        """
+        Replica el estado actual a todos los followers.
+        Solo el líder debe llamar este método.
+        """
+        if not self.cluster.is_leader():
+            return
+        
+        nodes = {nid: node.to_dict() for nid, node in self.registry.nodes.items()}
+        file_locations = dict(self.registry.file_locations)
+        
+        self.cluster.replicate_state(nodes, file_locations)
+    
+    def request_reconciliation_from_leader(self):
+        """
+        Solicita reconciliación al líder después de reconectarse.
+        Usado cuando un follower se reconecta tras una partición de red.
+        """
+        leader_addr = self.cluster.get_leader_address()
+        if not leader_addr or self.cluster.is_leader():
+            return None
+        
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(10)
+                sock.connect(leader_addr)
+                
+                # Enviar nuestro estado para reconciliación
+                our_state = {
+                    'nodes': {nid: node.to_dict() for nid, node in self.registry.nodes.items()},
+                    'file_locations': dict(self.registry.file_locations)
+                }
+                
+                request = {
+                    'action': 'request_reconciliation',
+                    'from_coordinator': self.coordinator_id,
+                    'state': our_state
+                }
+                
+                self._send_to_socket(sock, request)
+                response = self._receive_from_socket(sock)
+                
+                if response and response.get('reconciled_state'):
+                    self._apply_reconciled_state(response['reconciled_state'])
+                    self.logger.info("✅ Reconciliación con líder completada")
+                    return response
+                    
+        except Exception as e:
+            self.logger.error(f"❌ Error en reconciliación: {e}")
+        
+        return None
+    
+    def _on_new_leader_elected(self, leader_id: str, leader_host: str, leader_port: int):
+        """
+        Callback llamado cuando se acepta un nuevo líder.
+        Usado para sincronización automática después de partición de red.
+        """
+        self.logger.info(f"🔄 Nuevo líder detectado: {leader_id} en {leader_host}:{leader_port}")
+        
+        # Esperar un momento para que el líder esté listo
+        time.sleep(1)
+        
+        # Solicitar reconciliación al nuevo líder
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(10)
+                sock.connect((leader_host, leader_port))
+                
+                # Enviar nuestro estado para reconciliación
+                our_state = {
+                    'nodes': {nid: node.to_dict() for nid, node in self.registry.nodes.items()},
+                    'file_locations': dict(self.registry.file_locations)
+                }
+                
+                request = {
+                    'action': 'request_reconciliation',
+                    'from_coordinator': self.coordinator_id,
+                    'state': our_state
+                }
+                
+                self._send_to_socket(sock, request)
+                response = self._receive_from_socket(sock)
+                
+                if response and response.get('status') == 'ok':
+                    reconciled = response.get('reconciled_state', {})
+                    self._apply_reconciled_state(reconciled)
+                    
+                    nodes_count = len(reconciled.get('nodes', {}))
+                    files_count = len(reconciled.get('file_locations', {}))
+                    self.logger.info(
+                        f"✅ Reconciliación automática completada: "
+                        f"{nodes_count} nodos, {files_count} archivos"
+                    )
+                else:
+                    self.logger.warning(f"⚠️ Reconciliación falló: {response}")
+                    
+        except Exception as e:
+            self.logger.error(f"❌ Error en reconciliación automática: {e}")
+
     def _handle_search(self, request: dict) -> dict:
         """
         Coordina una búsqueda distribuida OPTIMIZADA.
@@ -956,11 +1370,21 @@ class CoordinatorNode:
         if self.stats['start_time']:
             uptime = time.time() - self.stats['start_time']
         
+        # Obtener estado del cluster de coordinadores (Bully)
+        cluster_status = self.cluster.get_cluster_status()
+        
         return {
             'status': 'success',
             'coordinator_id': self.coordinator_id,
             'coordinator_host': self.announce_host,
             'coordinator_port': self.port,
+            # === Estado del cluster de coordinadores (Bully) ===
+            'role': cluster_status.get('role', 'UNKNOWN'),
+            'is_leader': self.cluster.is_leader(),
+            'current_leader': cluster_status.get('current_leader'),
+            'coordinator_peers': cluster_status.get('alive_peers', 0),
+            'state_version': cluster_status.get('state_version', 0),
+            # === Estado de nodos de procesamiento ===
             'total_processing_nodes': len(nodes),
             'active_processing_nodes': len(active_nodes),
             'replication_factor': self.REPLICATION_FACTOR,

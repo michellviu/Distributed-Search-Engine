@@ -1,0 +1,14 @@
+{
+    "distributed": {
+        "coordinators": [
+            "192.168.1.101:5001",
+            "192.168.1.100:5000"
+        ],
+        "auto_reconnect": true,
+        "reconnect_interval": 3,
+        "failover_enabled": true
+    },
+    "logging": {
+        "level": "INFO"
+    }
+}

@@ -4,188 +4,343 @@
 
 ### Diseño del Sistema
 
-El sistema sigue una arquitectura **P2P (Peer-to-Peer) Estructurada con Coordinador Dinámico**. Aunque todos los nodos tienen la capacidad de comportarse como pares (almacenando y procesando datos), el sistema elige dinámicamente un líder (Coordinador) para tareas de gestión del clúster.
+El sistema utiliza una arquitectura **Coordinador/Nodos de Procesamiento** con roles claramente separados:
 
-### Organización
+1. **Nodo Coordinador**: Gestiona el cluster, mantiene metadatos, NO almacena datos
+2. **Nodos de Procesamiento**: Almacenan archivos, ejecutan búsquedas locales
 
-El sistema se organiza como un anillo lógico utilizando **Consistent Hashing**. Esto permite una distribución uniforme de la carga y de los datos entre los nodos disponibles sin necesidad de una tabla centralizada estática.
+### Diagrama de Arquitectura
+
+```
+                    ┌─────────────────────────────────────┐
+                    │           COORDINADOR               │
+                    │  - NodeRegistry (nodos activos)     │
+                    │  - Índice archivo → nodos           │
+                    │  - CHORD DNS (localización)         │
+                    │  - QuorumManager (consistencia)     │
+                    │  - Heartbeat Monitor                │
+                    │  - Balanceo de carga                │
+                    └────────────────┬────────────────────┘
+                                     │ TCP (puerto 5000)
+         ┌───────────────────────────┼───────────────────────────┐
+         │                           │                           │
+         ▼                           ▼                           ▼
+┌─────────────────┐         ┌─────────────────┐         ┌─────────────────┐
+│  PROCESAMIENTO  │         │  PROCESAMIENTO  │         │  PROCESAMIENTO  │
+│  - SearchEngine │         │  - SearchEngine │         │  - SearchEngine │
+│  - Indexer      │         │  - Indexer      │         │  - Indexer      │
+│  - FileTransfer │         │  - FileTransfer │         │  - FileTransfer │
+│  - Heartbeats   │         │  - Heartbeats   │         │  - Heartbeats   │
+└─────────────────┘         └─────────────────┘         └─────────────────┘
+```
 
 ### Roles del Sistema
 
-1. **Peer Node (Nodo Par):**
-    * Almacena fragmentos del índice invertido y archivos.
-    * Responde a consultas de búsqueda locales.
-    * Participa en la replicación de datos.
-2. **Coordinador (Líder):**
-    * Elegido dinámicamente entre los pares.
-    * Monitorea la salud del clúster (Heartbeats).
-    * Gestiona la entrada de nuevos nodos y el balanceo de carga inicial.
-3. **Cliente:**
-    * Entidad externa que se conecta a cualquier nodo (o al coordinador) para realizar búsquedas o solicitar indexación de archivos.
-
-### Distribución en Docker
-
-El sistema se despliega sobre una red virtual de Docker (`bridge` o `overlay`). Cada nodo es un contenedor independiente que expone:
-
-* Un puerto TCP para comandos y transferencia de datos.
-* Un puerto UDP para descubrimiento (Multicast) y heartbeats.
+| Rol | Responsabilidades | Almacena Datos |
+|-----|-------------------|----------------|
+| **Coordinador** | Registro de nodos, índice de archivos, balanceo de carga, coordinar búsquedas | NO |
+| **Procesamiento** | Almacenar archivos, indexar, ejecutar búsquedas locales, heartbeats | SÍ |
+| **Cliente** | Conectar al coordinador, realizar búsquedas/descargas/indexación | NO |
 
 ---
 
-## 2. Procesos
+## 2. Componentes Principales
 
-### Tipos de Procesos
+### 2.1 CoordinatorNode (`src/distributed/node/coordinator_node.py`)
 
-Cada nodo del sistema (`search-node`) ejecuta un proceso principal en Python (`main_distributed.py`). Dentro de este proceso, se utiliza un modelo de concurrencia basado en **Hilos (Threading)**.
+Nodo central que gestiona el cluster sin almacenar datos.
 
-### Organización de Procesos
+**Subcomponentes:**
+- `NodeRegistry`: Mapeo node_id → (IP, puerto) y archivo → lista de nodos
+- `ChordDNS`: Resolución de nombres con finger table O(log N)
+- `QuorumManager`: Protocolo de quorum para consistencia
 
-* **Main Thread:** Inicia el servidor y la lógica principal.
-* **TCP Server Thread:** Un servidor `ThreadingTCPServer` que genera un hilo nuevo por cada conexión de cliente o nodo entrante para manejar comandos (RPC simulado).
-* **Heartbeat Monitor Thread:** Un hilo en segundo plano (`HeartbeatMonitor`) que envía y verifica señales de vida de otros nodos.
-* **Discovery Thread:** Un hilo dedicado al descubrimiento de nodos mediante escaneo de subred TCP y conexión periódica a peers conocidos.
-* **Subnet Scanner Thread:** Escanea la subred local en paralelo buscando nodos activos en el puerto 5000.
-
-### Patrón de Diseño
-
-Se utiliza el patrón **Reactor/Event-Driven** para la red (a través de `socketserver`) combinado con **Worker Threads** para tareas de larga duración (como la indexación o la propagación de réplicas) para no bloquear el hilo principal de comunicación.
-
----
-
-## 3. Comunicación
-
-### Tipo de Comunicación
-
-La comunicación es **100% TCP**, optimizada para fiabilidad y compatibilidad con Docker:
-
-1. **TCP (Sockets):** Para operaciones críticas que requieren fiabilidad (Indexar, Buscar, Replicar, Votar en elección). Se utiliza un protocolo de mensajes basado en **JSON**.
-2. **TCP (IP Cache Discovery):** Para descubrimiento automático de nodos mediante escaneo de subred y registro bidireccional.
-3. **TCP (Health Check):** Para verificar la salud de los nodos (heartbeat).
-
-### Comunicación Cliente-Servidor
-
-El cliente se conecta vía TCP enviando un objeto JSON con el formato:
-
-```json
-{ "command": "search", "query": "termino", "args": {...} }
+**Funciones principales:**
+```python
+- register_node(node_id, host, port, files)  # Registrar nodo de procesamiento
+- handle_search(query, file_type)            # Coordinar búsqueda distribuida
+- handle_store(filename, content)            # Asignar nodos y distribuir archivo
+- handle_download(file_id)                   # Obtener archivo de un nodo
+- monitor_heartbeats()                       # Detectar nodos caídos
 ```
 
-El servidor procesa y responde con un JSON.
+### 2.2 ProcessingNode (`src/distributed/node/processing_node.py`)
 
-### Comunicación Servidor-Servidor
+Nodo que almacena y procesa datos localmente.
 
-Los nodos se comunican entre sí para:
+**Subcomponentes:**
+- `SearchEngine`: Motor de búsqueda local
+- `DocumentIndexer`: Indexación de documentos
+- `FileTransfer`: Transferencia de archivos
 
-* **Replicación:** Transferencia de datos a los nodos sucesores en el anillo.
-* **Elección:** Intercambio de mensajes del algoritmo Bully.
-* **Consulta Distribuida:** Propagación de la búsqueda a otros nodos si es necesario.
+**Funciones principales:**
+```python
+- auto_index()                    # Indexar archivos locales al iniciar
+- handle_search(query, file_type) # Búsqueda en índice local
+- handle_store(filename, content) # Almacenar archivo recibido
+- handle_download(file_id)        # Enviar archivo solicitado
+- send_heartbeat()                # Notificar salud al coordinador
+```
+
+### 2.3 NodeRegistry (`src/distributed/registry/node_registry.py`)
+
+Registro de nodos y ubicación de archivos.
+
+**Estructuras de datos:**
+```python
+nodes: Dict[str, NodeInfo]           # node_id → información del nodo
+file_locations: Dict[str, Set[str]]  # filename → set de node_ids
+```
+
+**Funciones principales:**
+```python
+- register_node(node_id, host, port)     # Registrar nodo
+- get_nodes_for_storage(replication_factor)  # Nodos menos cargados
+- register_file(filename, node_id)       # Registrar ubicación de archivo
+- get_file_locations(filename)           # Obtener nodos con el archivo
+```
+
+### 2.4 ChordDNS (`src/distributed/dns/chord_dns.py`)
+
+Sistema de nombres basado en CHORD para localización de nodos.
+
+**Características:**
+- Nodos virtuales (3 por nodo real) para distribución uniforme
+- Finger table para búsquedas O(log N)
+- Solo se usa para localizar nodos, NO para asignar almacenamiento
+
+### 2.5 QuorumManager (`src/distributed/consistency/quorum.py`)
+
+Protocolo de quorum para consistencia de datos replicados.
+
+**Niveles de consistencia:**
+| Nivel | Descripción |
+|-------|-------------|
+| `ONE` | Al menos 1 nodo confirma |
+| `QUORUM` | Mayoría de réplicas (N/2 + 1) |
+| `ALL` | Todas las réplicas confirman |
+
+### 2.6 CoordinatorCluster (`src/distributed/coordination/coordinator_cluster.py`)
+
+Soporte para múltiples coordinadores con elección de líder.
+
+**Algoritmo Bully:**
+1. Nodo detecta que el líder cayó
+2. Envía ELECTION a nodos con ID mayor
+3. Si recibe OK, espera
+4. Si no recibe OK, se declara líder
+5. Envía COORDINATOR a todos
 
 ---
 
-## 4. Coordinación
+## 3. Procesos y Concurrencia
 
-### Toma de Decisiones Distribuidas (Elección de Líder)
+### Modelo de Concurrencia
 
-Se implementa el **Algoritmo Bully**.
+El sistema usa **Threading** para manejar múltiples conexiones y tareas:
 
-* Cuando un nodo detecta que el coordinador ha caído (timeout de heartbeat), inicia una elección.
-* Los nodos con ID más alto tienen prioridad.
-* El ganador se anuncia a todos los demás como el nuevo coordinador.
+| Thread | Función |
+|--------|---------|
+| **Main** | Inicialización y servidor TCP |
+| **TCP Handler** | Un thread por conexión entrante |
+| **Heartbeat Sender** | Envío periódico de heartbeats (procesamiento) |
+| **Heartbeat Monitor** | Verificación de nodos (coordinador) |
+| **Replication Checker** | Verificar factor de replicación (coordinador) |
 
 ### Sincronización
 
-* **Heartbeats:** Los nodos envían pulsos periódicos. Si un nodo deja de responder, se marca como inactivo y se actualiza la lista de miembros (`membership list`).
-* **Acceso a Recursos:** Cada nodo gestiona su propio índice local con bloqueos a nivel de hilo (`threading.Lock`) para evitar condiciones de carrera durante la escritura (indexación) y lectura (búsqueda) simultáneas.
+- `threading.RLock` para acceso a estructuras compartidas
+- Operaciones atómicas en registros
 
 ---
 
-## 5. Nombrado y Localización
+## 4. Comunicación
 
-### Identificación
+### Protocolo TCP
 
-* **Nodos:** Se identifican por un ID único (ej. `node1`, `node2`) y su tupla de dirección `(IP, Puerto)`.
-* **Datos (Archivos):** Se identifican por el hash de su contenido o nombre.
+Todas las comunicaciones usan TCP con el formato:
+```
+[8 bytes ASCII: longitud][payload JSON]
+```
 
-### Ubicación (Consistent Hashing)
+### Mensajes del Coordinador
 
-Para localizar dónde debe guardarse o buscarse un dato, se utiliza un **Anillo de Hash Consistente** (`ConsistentHashRing`).
+```python
+# Registro de nodo
+{"action": "register_node", "node_id": "...", "host": "...", "port": 5000, "files": [...]}
 
-1. Se calcula el hash del nombre del archivo.
-2. Se ubica el nodo cuyo hash es igual o inmediatamente superior en el anillo.
-3. Esto elimina la necesidad de un servidor de nombres centralizado para localizar datos.
+# Búsqueda
+{"action": "search", "query": "python", "file_type": ".txt"}
 
-### Descubrimiento
+# Almacenar archivo
+{"action": "store", "filename": "doc.txt", "file_content": "<base64>"}
 
-Se utiliza **IP Cache Discovery**
+# Descargar archivo
+{"action": "download", "file_id": "doc.txt"}
 
-1. **Escaneo de Subred:** Al iniciar, cada nodo escanea la subred local (ej. `10.0.1.0/24`) buscando otros nodos en el puerto 5000.
-2. **Registro Bidireccional:** Cuando un nodo A contacta a un nodo B para obtener peers (`get_peers`), A envía su propia información. B registra a A automáticamente, creando un registro mutuo.
-3. **Propagación de Peers:** Cuando B responde a A, incluye la lista de todos los nodos que conoce. A registra esos nodos y puede contactarlos directamente.
-4. **Seed Nodes (Opcional):** Como respaldo, se pueden configurar nodos conocidos de antemano para acelerar el descubrimiento inicial.
+# Estado del cluster
+{"action": "cluster_status"}
 
----
+# Heartbeat
+{"action": "heartbeat", "node_id": "...", "files": [...]}
+```
 
-## 6. Consistencia y Replicación
+### Mensajes del Procesamiento
 
-### Distribución de Datos
+```python
+# Búsqueda local
+{"action": "search", "query": "...", "file_type": "..."}
 
-Los archivos no se guardan en un solo nodo. El índice invertido se fragmenta (sharding) basado en los términos o documentos.
+# Almacenar
+{"action": "store", "filename": "...", "file_content": "<base64>"}
 
-### Replicación
-
-Se utiliza una estrategia de **Replicación en Cadena** sobre el anillo de hash.
-
-* **Factor de Replicación (N):** Configurable (ej. N=3).
-* Un dato se guarda en el nodo propietario (determinado por el hash) y en sus `N-1` sucesores inmediatos en el anillo.
-
-### Consistencia (Quorum)
-
-Para garantizar la fiabilidad, se implementa un sistema de **Quorum** (`quorum.py`):
-
-* **Escritura (W):** La operación de indexado solo se confirma si al menos W réplicas confirman la escritura.
-* **Lectura (R):** Se puede configurar para leer de varias réplicas y comparar versiones, asegurando que no se lean datos obsoletos.
+# Descargar
+{"action": "download", "file_id": "..."}
+```
 
 ---
 
-## 7. Tolerancia a Fallas
+## 5. Consistencia y Replicación
+
+### Estrategia de Replicación
+
+- **Factor de replicación**: Configurable (default: 3)
+- **Asignación**: Por balanceo de carga (nodos menos cargados)
+- **Verificación**: Thread periódico verifica factor de replicación
+
+### Flujo de Almacenamiento
+
+```
+1. Cliente envía archivo al Coordinador
+2. Coordinador selecciona N nodos menos cargados
+3. Coordinador envía archivo a cada nodo seleccionado
+4. Cada nodo almacena, indexa, y confirma
+5. Coordinador actualiza índice de ubicaciones
+6. Coordinador responde al cliente con resultado
+```
+
+### Quorum
+
+```python
+# Escritura con quorum QUORUM (mayoría)
+required = replication_factor // 2 + 1  # Ej: 3 réplicas → 2 confirmaciones
+
+# Lectura con quorum ONE (cualquier réplica)
+# Se lee del primer nodo disponible
+```
+
+---
+
+## 6. Tolerancia a Fallos
 
 ### Detección de Fallos
 
-El módulo `HeartbeatMonitor` verifica constantemente la disponibilidad de los pares.
+| Mecanismo | Frecuencia | Acción |
+|-----------|------------|--------|
+| **Heartbeats** | Cada 5 segundos | Nodo envía heartbeat al coordinador |
+| **Timeout** | 15 segundos | Nodo marcado como inactivo |
+| **Health Check** | Bajo demanda | Cliente verifica coordinador |
 
-### Respuesta a Errores
+### Recuperación
 
-1. **Caída de un Nodo Par:**
-    * El sistema detecta la caída.
-    * Las peticiones de búsqueda se redirigen automáticamente a los nodos que poseen las réplicas de los datos del nodo caído (gracias al anillo de hash).
-2. **Caída del Coordinador:**
-    * Se dispara el algoritmo Bully.
-    * Se elige un nuevo líder automáticamente.
-    * El sistema sigue operando sin interrupción grave del servicio.
-3. **Nodos Nuevos:**
-    * Al entrar, se le asigna un rango del anillo de hash.
-    * (Futuro/Mejora) Se transfieren las llaves correspondientes desde los nodos vecinos para balancear la carga.
+| Fallo | Respuesta |
+|-------|-----------|
+| **Nodo de procesamiento cae** | Datos disponibles en réplicas, coordinador actualiza registro |
+| **Coordinador cae (Docker Swarm)** | Swarm reinicia automáticamente, nodos se re-registran |
+| **Coordinador cae (múltiples coords)** | Algoritmo Bully elige nuevo líder |
 
----
+### Docker Swarm
 
-## 8. Seguridad
-
-### Diseño Actual
-
-El sistema confía en la seguridad perimetral proporcionada por la red de Docker.
-
-* **Aislamiento:** Los nodos corren en una red privada interna. Solo los puertos necesarios se exponen al host.
-
-### Vulnerabilidades y Mejoras
-
-* **Autenticación:** Actualmente no hay autenticación entre nodos; cualquier proceso en la red interna puede enviar comandos.
-* **Encriptación:** La comunicación es texto plano (JSON).
-* **Autorización:** No hay roles de usuario diferenciados (admin vs usuario).
+```yaml
+deploy:
+  restart_policy:
+    condition: on-failure
+    delay: 5s
+    max_attempts: 3
+```
 
 ---
 
-### Resumen de Tecnologías
+## 7. Despliegue con Docker
 
-* **Lenguaje:** Python 3.9+
-* **Librerías Base:** `socket`, `threading`, `json`, `struct`.
-* **Infraestructura:** Docker, Docker Networking.
+### Arquitectura de Despliegue
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Docker Swarm Cluster                      │
+├─────────────────────────────────────────────────────────────┤
+│   ┌─────────────────┐                                        │
+│   │   Coordinator   │ ◄── Puerto 5000 expuesto               │
+│   │   (1 réplica)   │                                        │
+│   └────────┬────────┘                                        │
+│            │                                                 │
+│   ┌────────┴────────────────────────────────────┐           │
+│   │              Overlay Network                 │           │
+│   │            (search-network)                  │           │
+│   └─────────┬───────────┬───────────┬───────────┘           │
+│             │           │           │                        │
+│   ┌─────────────┐ ┌─────────────┐ ┌─────────────┐           │
+│   │ Processing  │ │ Processing  │ │ Processing  │           │
+│   │   Node 1    │ │   Node 2    │ │   Node 3    │           │
+│   └─────────────┘ └─────────────┘ └─────────────┘           │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Volúmenes
+
+| Volumen | Uso |
+|---------|-----|
+| `shared-files` | Archivos iniciales (solo lectura) |
+| `processing-data` | Datos de nodos de procesamiento |
+| `coordinator-logs` | Logs del coordinador |
+| `processing-logs` | Logs de procesamiento |
+
+### Variables de Entorno
+
+| Variable | Descripción | Default |
+|----------|-------------|---------|
+| `NODE_ROLE` | `coordinator` o `processing` | `processing` |
+| `NODE_ID` | ID único del nodo | Auto-generado |
+| `NODE_PORT` | Puerto TCP | `5000` |
+| `COORDINATOR_HOST` | Host del coordinador | `coordinator` |
+| `INDEX_PATH` | Directorio de archivos | `/home/app/data` |
+| `AUTO_INDEX` | Indexar al iniciar | `true` |
+
+---
+
+## 8. Cliente GUI
+
+### Características
+
+- Interfaz moderna con CustomTkinter (o Tkinter estándar)
+- Búsqueda con filtro por tipo de archivo
+- Listado de archivos del cluster
+- Descarga de archivos
+- Indexación de nuevos archivos
+- Reconexión automática
+
+### Uso
+
+```bash
+# Con CustomTkinter (interfaz moderna)
+pip install customtkinter
+python -m src.client.client_gui
+
+# Sin CustomTkinter (interfaz estándar)
+python -m src.client.client_gui
+```
+
+---
+
+## 9. Resumen de Tecnologías
+
+| Categoría | Tecnología |
+|-----------|------------|
+| **Lenguaje** | Python 3.9+ |
+| **Comunicación** | TCP Sockets + JSON |
+| **Concurrencia** | threading |
+| **Contenedores** | Docker + Docker Swarm |
+| **GUI** | CustomTkinter / Tkinter |
+| **Consistencia** | Quorum (ONE/QUORUM/ALL) |
+| **Nombrado** | CHORD DNS |
+| **Elección de líder** | Algoritmo Bully |
