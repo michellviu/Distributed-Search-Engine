@@ -164,6 +164,10 @@ class CoordinatorNode:
         if self.peer_coordinators:
             self.cluster.start()
             self.logger.info("✅ Cluster de coordinadores iniciado (Bully)")
+            
+            # 5. Iniciar sincronización continua de estado entre coordinadores
+            threading.Thread(target=self._state_sync_loop, daemon=True).start()
+            self.logger.info("✅ Sincronización de estado entre coordinadores iniciada")
         else:
             # Si no hay peers, somos el líder por defecto
             self.cluster.role = CoordinatorRole.LEADER
@@ -575,15 +579,34 @@ class CoordinatorNode:
         if not state_data:
             return {'status': 'error', 'message': 'No state data'}
         
-        # Aplicar el estado recibido
+        # Aplicar el estado recibido (solo si somos follower)
         applied = self.cluster.handle_state_replication(from_id, state_data)
         
         if applied:
-            # Sincronizar también el registry local con el estado del líder
-            if 'nodes' in state_data:
-                self.logger.info(f"📥 Sincronizando {len(state_data['nodes'])} nodos del líder")
-            if 'file_locations' in state_data:
-                self.logger.info(f"📥 Sincronizando {len(state_data['file_locations'])} archivos del líder")
+            # IMPORTANTE: Aplicar el estado al registry LOCAL
+            nodes_data = state_data.get('nodes', {})
+            file_locations = state_data.get('file_locations', {})
+            
+            # Actualizar nodos
+            for node_id, node_info in nodes_data.items():
+                if node_id not in self.registry.nodes:
+                    self.registry.register_node(
+                        node_id,
+                        node_info.get('host', 'unknown'),
+                        node_info.get('port', 5001)
+                    )
+                # Actualizar last_seen
+                self.registry.update_last_seen(node_id)
+            
+            # Actualizar ubicaciones de archivos
+            for file_name, locations in file_locations.items():
+                for node_id in locations:
+                    self.registry.register_file_location(file_name, node_id)
+            
+            self.logger.debug(
+                f"📥 Estado sincronizado del líder: "
+                f"{len(nodes_data)} nodos, {len(file_locations)} archivos"
+            )
         
         return {
             'status': 'ok' if applied else 'ignored',
@@ -692,6 +715,41 @@ class CoordinatorNode:
             for node_id in locations:
                 self.registry.register_file_location(file_name, node_id)
     
+    def _state_sync_loop(self):
+        """
+        Loop de sincronización continua de estado entre coordinadores.
+        
+        - Si somos LÍDER: Enviamos nuestro estado a todos los followers cada 5 segundos.
+        - Si somos FOLLOWER: Enviamos nuestro estado al líder (Anti-Entropy) para asegurar consistencia.
+        
+        Esto garantiza recuperación bidireccional tras particiones de red.
+        """
+        STATE_SYNC_INTERVAL = 5  # Segundos entre sincronizaciones
+        
+        while self.active:
+            time.sleep(STATE_SYNC_INTERVAL)
+            
+            try:
+                if self.cluster.is_leader():
+                    # Somos el líder: replicar estado a todos los followers
+                    nodes = {nid: node.to_dict() for nid, node in self.registry.nodes.items()}
+                    # IMPORTANTE: Convertir sets a lists para JSON serialization
+                    file_locations = {k: list(v) for k, v in self.registry.file_locations.items()}
+                    
+                    if nodes or file_locations:
+                        self.cluster.replicate_state(nodes, file_locations)
+                        self.logger.debug(
+                            f"📤 Estado replicado a followers: "
+                            f"{len(nodes)} nodos, {len(file_locations)} archivos"
+                        )
+                else:
+                    # Somos follower: asegurar que el líder tenga nuestros datos (Anti-Entropy)
+                    # Esto cubre el caso "Split Brain" donde recibimos datos aislados
+                    self.request_reconciliation_from_leader()
+                    
+            except Exception as e:
+                self.logger.debug(f"Error en sync loop: {e}")
+    
     def _replicate_state_to_followers(self):
         """
         Replica el estado actual a todos los followers.
@@ -701,7 +759,8 @@ class CoordinatorNode:
             return
         
         nodes = {nid: node.to_dict() for nid, node in self.registry.nodes.items()}
-        file_locations = dict(self.registry.file_locations)
+        # IMPORTANTE: Convertir sets a lists para JSON serialization
+        file_locations = {k: list(v) for k, v in self.registry.file_locations.items()}
         
         self.cluster.replicate_state(nodes, file_locations)
     
@@ -722,7 +781,8 @@ class CoordinatorNode:
                 # Enviar nuestro estado para reconciliación
                 our_state = {
                     'nodes': {nid: node.to_dict() for nid, node in self.registry.nodes.items()},
-                    'file_locations': dict(self.registry.file_locations)
+                    # IMPORTANTE: Convertir sets a lists para JSON serialization
+                    'file_locations': {k: list(v) for k, v in self.registry.file_locations.items()}
                 }
                 
                 request = {
@@ -763,7 +823,8 @@ class CoordinatorNode:
                 # Enviar nuestro estado para reconciliación
                 our_state = {
                     'nodes': {nid: node.to_dict() for nid, node in self.registry.nodes.items()},
-                    'file_locations': dict(self.registry.file_locations)
+                    # IMPORTANTE: Convertir sets a lists para JSON serialization
+                    'file_locations': {k: list(v) for k, v in self.registry.file_locations.items()}
                 }
                 
                 request = {

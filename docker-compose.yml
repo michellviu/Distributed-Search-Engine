@@ -38,6 +38,9 @@ services:
       - search-network
     deploy:
       replicas: 1
+      placement:
+        constraints:
+          - node.hostname == michell
       restart_policy:
         condition: on-failure
         delay: 5s
@@ -63,6 +66,9 @@ services:
       - search-network
     deploy:
       replicas: 1
+      placement:
+        constraints:
+          - node.hostname == eveliz
       restart_policy:
         condition: on-failure
         delay: 5s
@@ -86,7 +92,10 @@ services:
     volumes:
       - shared-files:/home/app/shared_files
     deploy:
-      replicas: 3
+      replicas: 4
+      placement:
+        preferences:
+          - spread: node.hostname
       restart_policy:
         condition: on-failure
         delay: 5s
