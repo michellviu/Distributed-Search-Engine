@@ -336,6 +336,9 @@ class CoordinatorNode:
         
         elif action == 'get_nodes':
             return self._handle_get_nodes(request)
+            
+        elif action == 'get_coordinators':
+            return self._handle_get_coordinators(request)
         
         elif action == 'get_file_locations':
             return self._handle_get_file_locations(request)
@@ -1134,6 +1137,39 @@ class CoordinatorNode:
             'status': 'success',
             'nodes': [n.to_dict() for n in nodes],
             'count': len(nodes)
+        }
+
+    def _handle_get_coordinators(self, request: dict) -> dict:
+        """
+        Devuelve lista de coordinadores conocidos en el cluster.
+        Usado para descubrimiento dinámico por parte de clientes.
+        """
+        peers = []
+        
+        # Agregar este mismo coordinador
+        peers.append({
+            'coordinator_id': self.coordinator_id,
+            'host': self.announce_host,
+            'port': self.port,
+            'is_leader': self.cluster.is_leader(),
+            'role': self.cluster.role.value if hasattr(self.cluster, 'role') else 'UNKNOWN'
+        })
+        
+        # Agregar peers conocidos
+        if hasattr(self.cluster, 'peers'):
+            for peer_id, peer in self.cluster.peers.items():
+                peers.append({
+                    'coordinator_id': peer.coordinator_id,
+                    'host': peer.host,
+                    'port': peer.port,
+                    'is_leader': False, # Solo estimación
+                    'role': peer.role.value if hasattr(peer, 'role') else 'UNKNOWN'
+                })
+        
+        return {
+            'status': 'success',
+            'coordinators': peers,
+            'count': len(peers)
         }
     
     def _handle_get_file_locations(self, request: dict) -> dict:

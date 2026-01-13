@@ -236,22 +236,46 @@ class CoordinatorDiscovery:
         try:
             for addr in self.coordinators:
                 host, port = addr.split(':')
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                    sock.settimeout(3)
-                    sock.connect((host, int(port)))
-                    
-                    request = json.dumps({'action': 'cluster_status'})
-                    sock.sendall(f"{len(request):<8}".encode() + request.encode())
-                    
-                    length = int(sock.recv(8).decode().strip())
-                    data = b''
-                    while len(data) < length:
-                        data += sock.recv(4096)
-                    
-                    response = json.loads(data.decode())
-                    # Buscar info de coordinadores en la respuesta
-                    return response.get('total_coordinators', 1)
+                # Aprovechar para actualizar la lista completa
+                if self.refresh_from_mid_stream(host, int(port)):
+                    return len(self.coordinators)
         except:
             pass
         
         return len(self.coordinators)
+
+    def refresh_from_mid_stream(self, host: str, port: int) -> bool:
+        """
+        Consulta a un coordinador activo por la lista completa de pares.
+        Esto permite descubrir nuevos nodos añadidos dinámicamente.
+        """
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(3)
+                sock.connect((host, port))
+                
+                request = json.dumps({'action': 'get_coordinators'})
+                sock.sendall(f"{len(request):<8}".encode() + request.encode())
+                
+                length_data = sock.recv(8)
+                if not length_data: return False
+                
+                length = int(length_data.decode().strip())
+                data = b''
+                while len(data) < length:
+                    chunk = sock.recv(4096)
+                    if not chunk: break
+                    data += chunk
+                
+                response = json.loads(data.decode())
+                if response.get('status') == 'success':
+                    coords = response.get('coordinators', [])
+                    for c in coords:
+                        c_host = c.get('host')
+                        c_port = c.get('port')
+                        if c_host and c_port:
+                            self.add_coordinator(f"{c_host}:{c_port}")
+                    return True
+        except Exception as e:
+            self.logger.debug(f"Error refreshing from {host}:{port}: {e}")
+        return False

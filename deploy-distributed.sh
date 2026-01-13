@@ -66,11 +66,11 @@ echo -e "${GREEN}📁 Preparando archivos de prueba...${NC}"
 # Crear volumen y copiar archivos
 docker volume create shared-files 2>/dev/null || true
 
-# Usar un contenedor temporal para copiar archivos
+# Usar un contenedor temporal para copiar archivos (limpiando primero para asegurar estado inicial limpio)
 docker run --rm \
     -v shared-files:/data \
     -v "$SCRIPT_DIR/shared_files:/source:ro" \
-    alpine sh -c "cp -r /source/* /data/ 2>/dev/null || true"
+    alpine sh -c "rm -rf /data/* && cp -r /source/* /data/ && echo 'Volumen actualizado con archivos originales'"
 
 echo -e "${GREEN}   ✓ Archivos copiados a volumen shared-files${NC}"
 
