@@ -1041,6 +1041,8 @@ class CoordinatorNode:
                 )
                 if success:
                     stored_nodes.append(target['node_id'])
+                    # Registrar ubicación inmediatamente para evitar inconsistencias si falla el callback
+                    self.registry.register_file_location(file_name, target['node_id'])
             
             if stored_nodes:
                 self.logger.info(f"✅ Archivo '{file_name}' distribuido a {len(stored_nodes)} nodos: {stored_nodes}")
