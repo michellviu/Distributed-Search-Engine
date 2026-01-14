@@ -171,28 +171,68 @@ class DistributedClient:
         self.discovery.start_auto_discovery(interval=30)
     
     def _find_active_coordinator(self) -> bool:
-        """Encuentra un coordinador activo"""
+        """Encuentra un coordinador activo, priorizando siempre al líder"""
         with self._lock:
+            # Primero: Intentar descubrir nuevos coordinadores
+            self._discover_coordinators_from_cluster()
+            
+            # Segundo: Buscar el líder conocido
             for coord in self.coordinators:
                 if coord.is_leader and coord.failures < self.MAX_FAILURES_BEFORE_SKIP:
                     if self._check_coordinator_health(coord):
+                        if coord != self.current_coordinator:
+                            self.logger.info(f"✅ Conectado al LÍDER: {coord.address}")
                         self.current_coordinator = coord
                         return True
             
+            # Tercero: Buscar cualquier coordinador activo y preguntar por el líder
             for coord in self.coordinators:
                 if coord.failures < self.MAX_FAILURES_BEFORE_SKIP:
                     if self._check_coordinator_health(coord):
+                        # Preguntar a este coordinador quién es el líder
+                        leader = self._ask_for_leader(coord)
+                        if leader and leader != coord:
+                            if self._check_coordinator_health(leader):
+                                self.logger.info(f"✅ Redirigido al LÍDER: {leader.address}")
+                                self.current_coordinator = leader
+                                return True
+                        # Si no hay líder conocido, usar este coordinador
+                        self.logger.info(f"⚠️ Conectado a coordinador (no líder): {coord.address}")
                         self.current_coordinator = coord
                         return True
             
-            # Resetear y reintentar
+            # Cuarto: Resetear y reintentar todos
             for coord in self.coordinators:
                 coord.failures = 0
                 if self._check_coordinator_health(coord):
+                    self.logger.info(f"⚠️ Reconectado a: {coord.address}")
                     self.current_coordinator = coord
                     return True
             
+            self.logger.error("❌ No hay coordinadores disponibles")
             return False
+    
+    def _ask_for_leader(self, coord: CoordinatorInfo) -> Optional[CoordinatorInfo]:
+        """Pregunta a un coordinador quién es el líder actual"""
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(5)
+                sock.connect((coord.host, coord.port))
+                
+                request = {'action': 'health'}
+                self._send_request(sock, request)
+                response = self._receive_response(sock)
+                
+                if response and response.get('status') == 'ok':
+                    leader_id = response.get('current_leader')
+                    if leader_id and not coord.is_leader:
+                        # Buscar el líder en nuestra lista
+                        for c in self.coordinators:
+                            if c.is_leader:
+                                return c
+        except:
+            pass
+        return None
     
     def _check_coordinator_health(self, coord: CoordinatorInfo) -> bool:
         """Verifica si un coordinador está vivo"""
@@ -219,15 +259,77 @@ class DistributedClient:
         return False
     
     def _health_check_loop(self):
-        """Verifica periódicamente la salud de los coordinadores"""
+        """Verifica periódicamente la salud de los coordinadores y descubre nuevos"""
         while self._active:
             time.sleep(self.HEALTH_CHECK_INTERVAL)
+            
+            # Descubrir nuevos coordinadores del cluster
+            self._discover_coordinators_from_cluster()
+            
+            # Verificar salud y re-encontrar líder si es necesario
             if self.current_coordinator:
                 if not self._check_coordinator_health(self.current_coordinator):
                     self._find_active_coordinator()
+                # Si el actual no es líder, intentar conectar al líder
+                elif not self.current_coordinator.is_leader:
+                    self._find_active_coordinator()
+            
             for coord in self.coordinators:
                 if coord != self.current_coordinator:
                     self._check_coordinator_health(coord)
+    
+    def _discover_coordinators_from_cluster(self):
+        """Pregunta a cualquier coordinador conocido por la lista actualizada de peers"""
+        for coord in self.coordinators:
+            if coord.failures >= self.MAX_FAILURES_BEFORE_SKIP:
+                continue
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                    sock.settimeout(5)
+                    sock.connect((coord.host, coord.port))
+                    
+                    request = {'action': 'get_coordinators'}
+                    self._send_request(sock, request)
+                    response = self._receive_response(sock)
+                    
+                    if response and response.get('status') == 'success':
+                        new_coords = response.get('coordinators', [])
+                        self._merge_coordinators(new_coords)
+                        return  # Solo necesitamos preguntar a uno
+            except Exception as e:
+                self.logger.debug(f"Error descubriendo desde {coord.address}: {e}")
+                continue
+    
+    def _merge_coordinators(self, new_coords: List[dict]):
+        """Agrega nuevos coordinadores descubiertos a la lista"""
+        with self._lock:
+            existing_addresses = {c.address for c in self.coordinators}
+            
+            for coord_info in new_coords:
+                host = coord_info.get('host')
+                port = coord_info.get('port', 5000)
+                is_leader = coord_info.get('is_leader', False)
+                
+                if not host:
+                    continue
+                
+                address = f"{host}:{port}"
+                
+                if address not in existing_addresses:
+                    new_coord = CoordinatorInfo(
+                        host=host,
+                        port=port,
+                        is_leader=is_leader
+                    )
+                    self.coordinators.append(new_coord)
+                    self.logger.info(f"🔍 Nuevo coordinador descubierto: {address}")
+                    existing_addresses.add(address)
+                else:
+                    # Actualizar info de líder en coordinadores existentes
+                    for existing in self.coordinators:
+                        if existing.address == address:
+                            existing.is_leader = is_leader
+                            break
     
     def _send_request(self, sock: socket.socket, request: dict):
         """Envía una request al coordinador"""
@@ -623,16 +725,45 @@ class SearchEngineGUI:
                 
                 ctk.CTkLabel(info_frame, text=f"Nodos de procesamiento: {len(nodes)}").pack(anchor="w", padx=10)
                 ctk.CTkLabel(info_frame, text=f"Archivos totales: {files}").pack(anchor="w", padx=10)
+                
+                # Mostrar detalles de nodos de procesamiento
+                if nodes:
+                    ctk.CTkLabel(
+                        status_window,
+                        text="\n⚙️ Nodos de Procesamiento",
+                        font=ctk.CTkFont(size=14, weight="bold") if CTK_AVAILABLE else ("Arial", 14, "bold")
+                    ).pack(pady=5)
+                    
+                    for node in nodes:
+                        node_frame = ctk.CTkFrame(status_window)
+                        node_frame.pack(fill="x", padx=10, pady=2)
+                        node_id = node.get('node_id', 'unknown')
+                        host = node.get('host', 'unknown')
+                        port = node.get('port', 5000)
+                        files_count = len(node.get('files', []))
+                        ctk.CTkLabel(node_frame, text=f"   📦 {node_id} ({host}:{port}) - {files_count} archivos").pack(anchor="w", padx=10)
         except:
             pass
         
+        # Botones de acción
+        btn_frame = ctk.CTkFrame(status_window)
+        btn_frame.pack(pady=20)
+        
+        # Botón refrescar
+        ctk.CTkButton(
+            btn_frame,
+            text="🔄 Refrescar",
+            command=lambda: [status_window.destroy(), self._show_cluster_status()],
+            width=100
+        ).pack(side="left", padx=10)
+        
         # Botón cerrar
         ctk.CTkButton(
-            status_window,
+            btn_frame,
             text="Cerrar",
             command=status_window.destroy,
             width=100
-        ).pack(pady=20)
+        ).pack(side="left", padx=10)
 
     def _setup_search_frame(self, parent):
         """Setup search input frame"""

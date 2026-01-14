@@ -50,12 +50,14 @@ else
     echo ""
 fi
 
-echo "Iniciando cliente GUI..."
+echo "Iniciando cliente GUI (Modo Distribuido)..."
 echo ""
 echo "Configuración:"
-echo "  - Servidor: localhost:5000"
+echo "  - Coordinadores: localhost:5000, localhost:5001"
 echo "  - Config: config/client_config.json"
 echo ""
 
 # Iniciar el cliente GUI
+# Nota: La lista de coordinadores por defecto está en config/client_config.json
+# Si deseas sobreescribirla, usa: --coordinators host1:port1 host2:port2
 python3 src/client/client_gui.py --config config/client_config.json

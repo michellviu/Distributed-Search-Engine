@@ -1,0 +1,37 @@
+# =============================================================================
+# Dockerfile para el Cliente GUI en Docker
+# Permite correr el cliente dentro de la red overlay para resolver hostnames
+# Requiere X11 forwarding para mostrar la GUI
+# =============================================================================
+
+FROM python:3.12-slim
+
+WORKDIR /home/app
+
+# Instalar dependencias del sistema para GUI (Tkinter y X11)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3-tk \
+    libx11-6 \
+    libxext6 \
+    libxrender1 \
+    libxft2 \
+    libfontconfig1 \
+    fonts-dejavu-core \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copiar archivos del proyecto
+COPY . /home/app
+
+# Instalar dependencias Python
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir customtkinter
+
+# Crear directorios necesarios
+RUN mkdir -p logs downloads
+
+# Variables de entorno por defecto
+ENV PYTHONUNBUFFERED=1
+ENV DISPLAY=:0
+
+# Comando por defecto
+CMD ["python3", "src/client/client_gui.py", "--config", "config/client_config.json"]

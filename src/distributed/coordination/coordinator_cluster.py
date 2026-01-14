@@ -157,6 +157,37 @@ class CoordinatorCluster:
         """Configura callback a llamar cuando se acepta un nuevo líder"""
         self._on_new_leader_callback = callback
     
+    def add_peer(self, coordinator_id: str, host: str, port: int):
+        """
+        Añade un nuevo peer al cluster dinámicamente.
+        
+        Args:
+            coordinator_id: ID del nuevo coordinador
+            host: Hostname o IP
+            port: Puerto
+        """
+        if coordinator_id == self.coordinator_id:
+            return
+
+        if coordinator_id not in self.peers:
+            self.logger.info(f"🆕 Nuevo peer descubierto: {coordinator_id} ({host}:{port})")
+            self.peers[coordinator_id] = CoordinatorPeer(
+                coordinator_id=coordinator_id,
+                host=host,
+                port=port,
+                is_alive=True,
+                last_seen=time.time()
+            )
+        else:
+            # Actualizar info si ya existe
+            peer = self.peers[coordinator_id]
+            if peer.host != host or peer.port != port:
+                self.logger.info(f"🔄 Actualizando info peer {coordinator_id}: {peer.host}:{peer.port} -> {host}:{port}")
+                peer.host = host
+                peer.port = port
+                peer.is_alive = True
+                peer.last_seen = time.time()
+
     def _add_peer_from_address(self, address: str):
         """Añade un peer desde una dirección 'host:port'"""
         try:
@@ -330,6 +361,8 @@ class CoordinatorCluster:
                 request = {
                     'action': 'coordinator_heartbeat',
                     'from_coordinator': self.coordinator_id,
+                    'from_host': self.host,
+                    'from_port': self.port,
                     'role': self.role.value
                 }
                 
@@ -518,16 +551,11 @@ class CoordinatorCluster:
     def handle_bully_message(self, message_type: str, from_id: str, from_host: str, from_port: int) -> dict:
         """
         Procesa un mensaje del algoritmo Bully.
-        
-        Args:
-            message_type: ELECTION, OK, o COORDINATOR
-            from_id: ID del coordinador que envía
-            from_host: Host del coordinador
-            from_port: Puerto del coordinador
-            
-        Returns:
-            Respuesta apropiada
         """
+        # Auto-registro del peer si no lo conocemos (Gossip)
+        if from_id and from_host and from_port:
+            self.add_peer(from_id, from_host, from_port)
+
         msg_type = BullyMessage(message_type)
         
         if msg_type == BullyMessage.ELECTION:

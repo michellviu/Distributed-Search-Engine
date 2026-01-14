@@ -1,0 +1,19 @@
+{
+    "distributed": {
+        "coordinators": [
+            "coordinator1:5000",
+            "coordinator2:5000"
+        ],
+        "auto_reconnect": true,
+        "reconnect_interval": 5
+    },
+    "server": {
+        "host": "coordinator1",
+        "port": 5000
+    },
+    "logging": {
+        "level": "INFO",
+        "file": "logs/client.log",
+        "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    }
+}

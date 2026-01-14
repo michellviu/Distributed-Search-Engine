@@ -560,9 +560,15 @@ class CoordinatorNode:
         Usado para detectar si el líder sigue vivo.
         """
         from_id = request.get('from_coordinator')
+        from_host = request.get('from_host')
+        from_port = request.get('from_port')
         role = request.get('role', 'FOLLOWER')
         
         self.logger.debug(f"💓 Heartbeat de coordinador: {from_id} ({role})")
+        
+        # Gossip: Si el coordinador que nos contacta no lo conocemos, lo agregamos
+        if from_id and from_host and from_port:
+            self.cluster.add_peer(from_id, from_host, from_port)
         
         return {
             'status': 'ok',
