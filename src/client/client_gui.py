@@ -127,6 +127,47 @@ class DistributedClient:
     RETRY_DELAY = 1.0
     HEALTH_CHECK_INTERVAL = 10
     MAX_FAILURES_BEFORE_SKIP = 3
+    DISCOVERED_COORDINATORS_FILE = "discovered_coordinators.json"
+    
+    @classmethod
+    def _get_persistence_path(cls) -> Path:
+        """Obtiene la ruta del archivo de persistencia"""
+        # Usar directorio del usuario para persistencia
+        base_dir = Path.home() / ".distributed-search-client"
+        base_dir.mkdir(exist_ok=True)
+        return base_dir / cls.DISCOVERED_COORDINATORS_FILE
+    
+    @classmethod
+    def load_persisted_coordinators(cls) -> List[str]:
+        """Carga coordinadores descubiertos previamente"""
+        try:
+            path = cls._get_persistence_path()
+            if path.exists():
+                with open(path, 'r') as f:
+                    data = json.load(f)
+                    coords = data.get('coordinators', [])
+                    if coords:
+                        logging.getLogger("DistributedClient").info(
+                            f"📂 Cargados {len(coords)} coordinadores persistidos"
+                        )
+                    return coords
+        except Exception as e:
+            logging.getLogger("DistributedClient").debug(f"Error cargando coordinadores: {e}")
+        return []
+    
+    def _save_coordinators(self):
+        """Guarda los coordinadores conocidos para persistencia"""
+        try:
+            path = self._get_persistence_path()
+            coords = [c.address for c in self.coordinators if c.is_alive or c.failures < 5]
+            with open(path, 'w') as f:
+                json.dump({
+                    'coordinators': coords,
+                    'last_updated': time.time()
+                }, f, indent=2)
+            self.logger.debug(f"💾 Guardados {len(coords)} coordinadores")
+        except Exception as e:
+            self.logger.debug(f"Error guardando coordinadores: {e}")
     
     def __init__(self, coordinator_addresses: List[str] = None):
         """
@@ -136,9 +177,20 @@ class DistributedClient:
         """
         self.logger = logging.getLogger("DistributedClient")
         
-        # Usar descubrimiento automático o direcciones proporcionadas
+        # Combinar: coordinadores proporcionados + persistidos
+        all_addresses = set()
+        
+        # 1. Agregar coordinadores proporcionados (semillas)
         if coordinator_addresses:
-            discovery = CoordinatorDiscovery(initial_addresses=coordinator_addresses)
+            all_addresses.update(coordinator_addresses)
+        
+        # 2. Agregar coordinadores persistidos (descubiertos anteriormente)
+        persisted = self.load_persisted_coordinators()
+        all_addresses.update(persisted)
+        
+        # 3. Usar descubrimiento si tenemos direcciones, sino automático
+        if all_addresses:
+            discovery = CoordinatorDiscovery(initial_addresses=list(all_addresses))
         else:
             discovery = CoordinatorDiscovery()
         
@@ -153,7 +205,8 @@ class DistributedClient:
             self.coordinators.append(CoordinatorInfo(host=host, port=port))
         
         if not self.coordinators:
-            raise ValueError("No se encontraron coordinadores")
+            # raise ValueError("No se encontraron coordinadores")
+            self.logger.warning("⚠️ No se encontraron coordinadores iniciales. Esperando configuración manual.")
         
         self.current_coordinator: Optional[CoordinatorInfo] = None
         self._lock = threading.RLock()
@@ -161,8 +214,9 @@ class DistributedClient:
         
         self.logger.info(f"Cliente inicializado con {len(self.coordinators)} coordinadores")
         
-        # Conectar al primer coordinador disponible
-        self._find_active_coordinator()
+        # Conectar ao primer coordinador disponible (si existe)
+        if self.coordinators:
+            self._find_active_coordinator()
         
         # Health check en background
         threading.Thread(target=self._health_check_loop, daemon=True).start()
@@ -170,6 +224,25 @@ class DistributedClient:
         # Descubrimiento automático cada 30 segundos
         self.discovery.start_auto_discovery(interval=30)
     
+    def add_manual_coordinator(self, host: str, port: int) -> bool:
+        """Agrega un coordinador manualmente e intenta conectar"""
+        address = f"{host}:{port}"
+        with self._lock:
+            # Verificar si ya existe
+            for coord in self.coordinators:
+                if coord.address == address:
+                    return False
+            
+            new_coord = CoordinatorInfo(host=host, port=port)
+            self.coordinators.append(new_coord)
+            self.logger.info(f"➕ Coordinador manual agregado: {address}")
+            self._save_coordinators()
+        
+        # Intentar conectar inmediatamente
+        if not self.current_coordinator:
+            return self._find_active_coordinator()
+        return True
+
     def _find_active_coordinator(self) -> bool:
         """Encuentra un coordinador activo, priorizando siempre al líder"""
         with self._lock:
@@ -301,7 +374,8 @@ class DistributedClient:
                 continue
     
     def _merge_coordinators(self, new_coords: List[dict]):
-        """Agrega nuevos coordinadores descubiertos a la lista"""
+        """Agrega nuevos coordinadores descubiertos a la lista y los persiste"""
+        added_new = False
         with self._lock:
             existing_addresses = {c.address for c in self.coordinators}
             
@@ -324,12 +398,17 @@ class DistributedClient:
                     self.coordinators.append(new_coord)
                     self.logger.info(f"🔍 Nuevo coordinador descubierto: {address}")
                     existing_addresses.add(address)
+                    added_new = True
                 else:
                     # Actualizar info de líder en coordinadores existentes
                     for existing in self.coordinators:
                         if existing.address == address:
                             existing.is_leader = is_leader
                             break
+        
+        # Persistir si se agregaron nuevos coordinadores
+        if added_new:
+            self._save_coordinators()
     
     def _send_request(self, sock: socket.socket, request: dict):
         """Envía una request al coordinador"""
@@ -569,11 +648,19 @@ class SearchEngineGUI:
         self._setup_ui()
         
     def _connect_to_cluster(self):
-        """Conectar al cluster de coordinadores"""
+        """Conectar al cluster de coordinadores (usando semillas + persistidos)"""
         try:
-            # Usar coordinadores configurados o descubrimiento automático
+            # Combinar coordinadores configurados + persistidos
+            all_coords = set()
             if self.coordinator_addresses:
-                self.client = DistributedClient(self.coordinator_addresses)
+                all_coords.update(self.coordinator_addresses)
+            
+            # Agregar coordinadores persistidos
+            persisted = DistributedClient.load_persisted_coordinators()
+            all_coords.update(persisted)
+            
+            if all_coords:
+                self.client = DistributedClient(list(all_coords))
             else:
                 # Descubrimiento automático
                 self.client = DistributedClient()
@@ -740,14 +827,24 @@ class SearchEngineGUI:
                         node_id = node.get('node_id', 'unknown')
                         host = node.get('host', 'unknown')
                         port = node.get('port', 5000)
-                        files_count = len(node.get('files', []))
-                        ctk.CTkLabel(node_frame, text=f"   📦 {node_id} ({host}:{port}) - {files_count} archivos").pack(anchor="w", padx=10)
+                        # files_count viene directamente del NodeInfo.to_dict()
+                        files_count = node.get('files_count', 0)
+                        current_tasks = node.get('current_tasks', 0)
+                        ctk.CTkLabel(node_frame, text=f"   📦 {node_id} ({host}:{port}) - {files_count} archivos, {current_tasks} tareas").pack(anchor="w", padx=10)
         except:
             pass
         
         # Botones de acción
         btn_frame = ctk.CTkFrame(status_window)
         btn_frame.pack(pady=20)
+
+        # Botón Agregar Coordinador Manual
+        ctk.CTkButton(
+            btn_frame,
+            text="➕ Agregar IP",
+            command=self._on_add_coordinator_click,
+            width=100
+        ).pack(side="left", padx=10)
         
         # Botón refrescar
         ctk.CTkButton(
@@ -764,6 +861,31 @@ class SearchEngineGUI:
             command=status_window.destroy,
             width=100
         ).pack(side="left", padx=10)
+
+    def _on_add_coordinator_click(self):
+        """Muestra diálogo para agregar coordinador manual"""
+        dialog = ctk.CTkInputDialog(
+            text="Ingrese IP:PUERTO del coordinador:\n(Ej: 192.168.1.50:5000 o coordinator1:5000)",
+            title="Agregar Coordinador"
+        )
+        addr = dialog.get_input()
+        if addr:
+            try:
+                parts = addr.split(':')
+                host = parts[0]
+                port = int(parts[1]) if len(parts) > 1 else 5000
+                
+                if self.client:
+                    self.client.add_manual_coordinator(host, port)
+                    messagebox.showinfo("Éxito", f"Coordinador {host}:{port} agregado.")
+                else:
+                    # Si no había cliente, crearlo ahora
+                    self.coordinator_addresses = [f"{host}:{port}"]
+                    self._connect_to_cluster()
+                    if self.client:
+                        messagebox.showinfo("Éxito", f"Cliente iniciado con {host}:{port}")
+            except Exception as e:
+                messagebox.showerror("Error", f"Formato inválido: {e}")
 
     def _setup_search_frame(self, parent):
         """Setup search input frame"""
@@ -1081,14 +1203,30 @@ class SearchEngineGUI:
             self.root.after(0, messagebox.showerror, "Error", f"Error al indexar: {e}")
     
     def _on_reconnect(self):
-        """Handle reconnect button click"""
+        """Handle reconnect button click - usa coordinadores actuales + persistidos"""
         self._log("Intentando reconectar al cluster...")
         
-        # Cerrar cliente anterior si existe
+        # Obtener coordinadores actuales antes de cerrar
+        current_coords = []
         if self.client:
+            current_coords = [c.address for c in self.client.coordinators]
             self.client.close()
         
-        self._connect_to_cluster()
+        # Combinar: coordinadores actuales + persistidos + semillas originales
+        all_coords = set(current_coords)
+        all_coords.update(DistributedClient.load_persisted_coordinators())
+        if self.coordinator_addresses:
+            all_coords.update(self.coordinator_addresses)
+        
+        # Crear nuevo cliente con todos los coordinadores conocidos
+        try:
+            if all_coords:
+                self.client = DistributedClient(list(all_coords))
+            else:
+                self.client = DistributedClient()
+        except Exception as e:
+            self._log(f"Error creando cliente: {e}", "ERROR")
+            self.client = None
         
         if self.client and self.client.current_coordinator:
             coord = self.client.current_coordinator
@@ -1096,8 +1234,8 @@ class SearchEngineGUI:
             if coord.is_leader:
                 status_text += " (Líder)"
             self.status_label.configure(text=status_text, text_color="green" if CTK_AVAILABLE else None)
-            self._log("✓ Reconexión exitosa", "SUCCESS")
-            messagebox.showinfo("Éxito", f"Reconectado al coordinador:\n{coord.address}")
+            self._log(f"✓ Reconexión exitosa ({len(self.client.coordinators)} coordinadores conocidos)", "SUCCESS")
+            messagebox.showinfo("Éxito", f"Reconectado al coordinador:\n{coord.address}\n\nCoordinadores conocidos: {len(self.client.coordinators)}")
         else:
             self.status_label.configure(text="✗ Desconectado", text_color="red" if CTK_AVAILABLE else None)
             self._log("Error al reconectar", "ERROR")

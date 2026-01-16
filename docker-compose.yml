@@ -29,7 +29,8 @@ services:
         constraints:
           - node.hostname == michell
       restart_policy:
-        condition: none
+        condition: on-failure
+        delay: 120s
 
   # ---------------------------------------------------------------------------
   # COORDINADOR 2 (Host: eveliz) -> Port 5001
@@ -58,7 +59,8 @@ services:
         constraints:
           - node.hostname == eveliz
       restart_policy:
-        condition: none
+        condition: on-failure
+        delay: 120s
 
   # ---------------------------------------------------------------------------
   # NODO PROCESAMIENTO 1 (Host: michell)
@@ -75,19 +77,24 @@ services:
       - ANNOUNCE_HOST=processing1
       - AUTO_INDEX=true
       - INIT_FILES_PATH=/home/app/shared_files
+      - INDEX_PATH=/home/app/shared_files
+      - DATA_PATH=/home/app/data
       - LOG_LEVEL=INFO
     networks:
       - search-network
     volumes:
-      - shared-files:/home/app/shared_files
+      # Cada nodo tiene su propio volumen de almacenamiento
+      - processing1-data:/home/app/data
+      # Volumen compartido solo para archivos iniciales de lectura
+      - shared-files:/home/app/shared_files:ro
     deploy:
       replicas: 1
       placement:
         constraints:
           - node.hostname == michell
       restart_policy:
-        condition: none
-
+        condition: on-failure
+        delay: 120s
   # ---------------------------------------------------------------------------
   # NODO PROCESAMIENTO 2 (Host: eveliz)
   # ---------------------------------------------------------------------------
@@ -103,18 +110,24 @@ services:
       - ANNOUNCE_HOST=processing2
       - AUTO_INDEX=true
       - INIT_FILES_PATH=/home/app/shared_files
+      - INDEX_PATH=/home/app/shared_files
+      - DATA_PATH=/home/app/data
       - LOG_LEVEL=INFO
     networks:
       - search-network
     volumes:
-      - shared-files:/home/app/shared_files
+      # Cada nodo tiene su propio volumen de almacenamiento
+      - processing2-data:/home/app/data
+      # Volumen compartido solo para archivos iniciales de lectura
+      - shared-files:/home/app/shared_files:ro
     deploy:
       replicas: 1
       placement:
         constraints:
           - node.hostname == eveliz
       restart_policy:
-        condition: none
+        condition: on-failure
+        delay: 120s
 
 networks:
   search-network:
@@ -122,5 +135,9 @@ networks:
     attachable: true
 
 volumes:
+  # Volumen compartido para archivos iniciales (solo lectura para nodos)
   shared-files:
     external: true
+  # Volúmenes individuales para cada nodo de procesamiento
+  processing1-data:
+  processing2-data:

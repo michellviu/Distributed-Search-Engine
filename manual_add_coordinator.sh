@@ -1,33 +1,61 @@
 #!/bin/bash
 # Script para iniciar un COORDINADOR manualmente en un nodo específico del Swarm
-# Uso: ./manual_add_coordinator.sh <ID> <PUERTO_HOST> <HOSTNAME_DESTINO>
+# Uso: ./manual_add_coordinator.sh <ID> <PUERTO_HOST> <HOSTNAME_DESTINO> [SEED_PEER]
+#
+# El coordinador usará gossip para descubrir otros coordinadores a partir del seed.
+# Si el seed no está disponible, el coordinador funcionará como líder independiente.
 
-if [ "$#" -ne 3 ]; then
+if [ "$#" -lt 2 ]; then
     echo "❌ Error: Faltan argumentos."
-    echo "Uso: $0 <ID> <PUERTO_HOST> <HOSTNAME_DESTINO>"
-    echo "Ejemplo: $0 3 5003 michell"
+    echo ""
+    echo "Uso: $0 <ID> <PUERTO_HOST> [SEED_PEER]"
+    echo ""
+    echo "Parámetros:"
+    echo "  ID              - Identificador numérico del coordinador (ej: 1, 2)"
+    echo "  PUERTO_HOST     - Puerto en el host (ej: 5003, 5004)"
+    echo "  SEED_PEER       - (Opcional) Peer semilla host:port (ej: coordinator1:5000)"
+    echo ""
+    echo "Nota: Este script ejecuta 'docker run' en la máquina local."
+    echo "      Debes estar conectado a la red 'search-network'."
     exit 1
 fi
 
 ID=$1
 PORT=$2
-TARGET_NODE=$3
-SEED_PEER=${4:-coordinator1:5000}  # Nodo semilla por defecto
+# El tercer argumento ahora es opcional (Seed), y el destino se elimina porque es local
+SEED_PEER=${3:-} 
 
-SERVICE_NAME="manual_coord_$ID"
-NETWORK="search_search-network"
+CONTAINER_NAME="coordinator$ID"
+NETWORK="search-network"
 
-echo "🚀 Creando Coordinador Manual $ID en nodo '$TARGET_NODE'..."
-echo "   🌱 Seed Peer: $SEED_PEER"
+# Crear directorio de logs local si no existe para montar
+mkdir -p logs
 
-docker service create \
-    --name "$SERVICE_NAME" \
+echo "=============================================="
+echo "🚀 Iniciando Coordinador Manual (Docker Run)"
+echo "=============================================="
+echo "   🎯 Nombre:      $CONTAINER_NAME"
+echo "   🔌 Puerto:      $PORT"
+if [ -n "$SEED_PEER" ]; then
+    echo "   🌱 Seed Peer:   $SEED_PEER"
+else
+    echo "   🌱 Seed Peer:   (Coordinador Semilla/Líder)"
+fi
+
+# Eliminar contenedor previo si existe
+docker rm -f $CONTAINER_NAME 2>/dev/null
+
+# Asegurar que la red existe
+docker network inspect $NETWORK >/dev/null 2>&1 || docker network create $NETWORK
+
+docker run -d \
+    --name "$CONTAINER_NAME" \
     --network "$NETWORK" \
-    --restart-condition none \
-    --constraint "node.hostname == $TARGET_NODE" \
-    --publish "$PORT:5000" \
+    --restart no \
+    -p "$PORT:5000" \
+    -v "$(pwd)/logs:/home/app/logs" \
     --env NODE_ROLE=coordinator \
-    --env NODE_ID="manual-coord-$ID" \
+    --env NODE_ID="$CONTAINER_NAME" \
     --env NODE_HOST="0.0.0.0" \
     --env NODE_PORT=5000 \
     --env PEER_DISCOVERY=manual \
@@ -37,11 +65,9 @@ docker service create \
     search-engine:distributed
 
 if [ $? -eq 0 ]; then
-    echo "✅ Servicio $SERVICE_NAME creado exitosamente."
-    echo "   📍 Nodo Destino: $TARGET_NODE"
-    echo "   🔌 Puerto: $PORT"
-    echo "   📝 Para eliminarlo: docker service rm $SERVICE_NAME"
-    echo "   💀 Para simular crash: Busca el contenedor en '$TARGET_NODE' y haz 'docker kill'"
+    echo ""
+    echo "✅ Contenedor $CONTAINER_NAME iniciado."
+    echo "📝 Logs: docker logs -f $CONTAINER_NAME"
 else
-    echo "❌ Error al crear el servicio."
+    echo "❌ Error al iniciar el contenedor."
 fi

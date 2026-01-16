@@ -119,12 +119,19 @@ class CoordinatorNode:
         self.server_socket = None
         self._lock = threading.RLock()
         
+        # Seguimiento de replicaciones en progreso
+        self._replication_in_progress = {}  # {file_name: set(target_node_ids)}
+        self._replication_lock = threading.Lock()
+        
         # Estadísticas
         self.stats = {
             'queries_processed': 0,
             'files_stored': 0,
             'optimized_searches': 0,
-            'start_time': None
+            'start_time': None,
+            'replications_requested': 0,
+            'replications_succeeded': 0,
+            'replications_failed': 0
         }
         
         self.logger.info(f"🎯 Coordinador inicializado: {coordinator_id}")
@@ -319,7 +326,10 @@ class CoordinatorNode:
         """
         action = request.get('action', '')
         
-        if action == 'register':
+        if action == 'request_sync':
+            return self._handle_request_sync(request)
+            
+        elif action == 'register':
             return self._handle_register(request)
         
         elif action == 'heartbeat':
@@ -384,8 +394,81 @@ class CoordinatorNode:
         else:
             return {'status': 'error', 'message': f'Unknown action: {action}'}
     
+    def _handle_request_sync(self, request: dict) -> dict:
+        """
+        Maneja solicitud de sincronización de un nodo nuevo/reconectado.
+        Verifica qué archivos le faltan y ordena replicación.
+        """
+        node_id = request.get('node_id')
+        current_files = set(request.get('current_files', []))
+        
+        if not node_id:
+            return {'status': 'error', 'message': 'Missing node_id'}
+        
+        self.logger.info(f"🔄 Iniciando sincronización para nodo {node_id}")
+        
+        # Obtener todos los archivos conocidos en el sistema
+        all_known_files = self.registry.get_all_file_names()
+        files_to_sync = []
+        
+        for file_name in all_known_files:
+            if file_name not in current_files:
+                # El nodo no tiene este archivo, verificar si necesita réplica
+                # (o si forzamos full replication como pidió el usuario)
+                files_to_sync.append(file_name)
+        
+        if files_to_sync:
+            self.logger.info(f"📦 Nodo {node_id} necesita {len(files_to_sync)} archivos")
+            # Iniciar replicación en background para no bloquear
+            threading.Thread(
+                target=self._push_files_to_node,
+                args=(node_id, files_to_sync),
+                daemon=True
+            ).start()
+            
+        return {'status': 'success', 'scheduled': len(files_to_sync)}
+
+    def _push_files_to_node(self, target_node_id: str, files: List[str]):
+        """Envía archivos faltantes a un nodo específico"""
+        target_node = self.registry.lookup(target_node_id)
+        if not target_node:
+            return
+
+        for file_name in files:
+            # Buscar quién tiene el archivo (source)
+            locations = self.registry.get_file_locations(file_name)
+            if not locations:
+                continue
+                
+            # Elegir un source activo
+            source_id = locations[0]
+            source_node = self.registry.lookup(source_id)
+            
+            if source_node:
+                if self._check_node_health(source_node):
+                    self.logger.info(f"🔄 Replicando '{file_name}' de {source_id} a {target_node_id}")
+                    self._trigger_replication(file_name, source_node, target_node)
+                    time.sleep(0.5)  # Evitar saturación
+                else:
+                    self.logger.warning(f"⚠️ No se puede replicar '{file_name}': Fuente {source_id} no responde health check")
+            else:
+                self.logger.warning(f"⚠️ No se puede replicar '{file_name}': Fuente {source_id} no encontrada en registro")
+
     def _handle_register(self, request: dict) -> dict:
         """Registra un nodo de procesamiento"""
+        # Validar si somos el líder. Si no, redirigir.
+        if not self.cluster.is_leader():
+            leader_id = self.cluster.current_leader
+            leader_addr = self.cluster.get_leader_address() # Retorna tupla (host, port) o None
+            
+            if leader_id and leader_addr:
+                return {
+                    'status': 'redirect',
+                    'leader_host': leader_addr[0],
+                    'leader_port': leader_addr[1],
+                    'message': f'Redirect to leader {leader_id}'
+                }
+
         node_id = request.get('node_id')
         host = request.get('host')
         port = request.get('port', 5001)
@@ -1012,18 +1095,19 @@ class CoordinatorNode:
                 'already_exists': True
             }
         
-        # Archivo nuevo: asignar a los nodos menos cargados
-        target_node_ids = self.registry.get_nodes_for_storage(
-            file_name, 
-            self.REPLICATION_FACTOR
-        )
+        # Archivo nuevo: asignar a TODOS los nodos activos si queremos full replication
+        # o usar REPLICATION_FACTOR.
+        # Aquí asignamos a TODOS para garantizar disponibilidad inmediata
+        all_active_nodes = self.registry.get_active_nodes(max_age_seconds=self.NODE_TIMEOUT)
+        target_node_ids = [n.node_id for n in all_active_nodes]
         
+        # Si no hay suficientes nodos activos, al menos intentar con el factor mínimo
         if not target_node_ids:
             return {
                 'status': 'error',
                 'message': 'No processing nodes available for storage'
             }
-        
+
         # Resolver IDs a direcciones
         target_nodes = []
         for node_id in target_node_ids:
@@ -1127,6 +1211,13 @@ class CoordinatorNode:
         
         self.registry.register_file_location(file_name, node_id)
         self.stats['files_stored'] += 1
+        
+        # Remover de replicaciones en progreso
+        with self._replication_lock:
+            if file_name in self._replication_in_progress:
+                self._replication_in_progress[file_name].discard(node_id)
+                if not self._replication_in_progress[file_name]:
+                    del self._replication_in_progress[file_name]
         
         self.logger.info(f"📍 Confirmado: '{file_name}' almacenado en {node_id}")
         
@@ -1311,6 +1402,10 @@ class CoordinatorNode:
         while self.active:
             time.sleep(self.HEARTBEAT_INTERVAL)
             
+            # Solo el líder gestiona la salud activa de los nodos
+            if not self.cluster.is_leader():
+                continue
+
             nodes = self.registry.get_all_nodes()
             current_time = time.time()
             dead_nodes = []
@@ -1385,8 +1480,12 @@ class CoordinatorNode:
     def _replication_check_loop(self):
         """Verifica periódicamente que los archivos tengan suficientes réplicas"""
         while self.active:
-            time.sleep(30)  # Cada 30 segundos
+            time.sleep(5)  # Cada 5 segundos (más rápido para pruebas)
             
+            # Solo el líder gestiona la replicación
+            if not self.cluster.is_leader():
+                continue
+
             files_needing_replication = self.registry.get_files_needing_replication()
             
             if files_needing_replication:
@@ -1424,9 +1523,21 @@ class CoordinatorNode:
     
     def _trigger_replication(self, file_name: str, source: NodeInfo, target: NodeInfo):
         """Solicita a un nodo que replique un archivo a otro nodo"""
+        # Verificar si ya está en progreso
+        with self._replication_lock:
+            if file_name not in self._replication_in_progress:
+                self._replication_in_progress[file_name] = set()
+            
+            if target.node_id in self._replication_in_progress[file_name]:
+                self.logger.debug(f"⏳ Replicación de '{file_name}' a {target.node_id} ya en progreso")
+                return
+            
+            # Marcar como en progreso
+            self._replication_in_progress[file_name].add(target.node_id)
+        
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                sock.settimeout(10)
+                sock.settimeout(30)  # Aumentar timeout para archivos grandes
                 sock.connect((source.host, source.port))
                 
                 request = {
@@ -1442,9 +1553,39 @@ class CoordinatorNode:
                 sock.sendall(req_json.encode())
                 
                 self.logger.info(f"📤 Solicitada replicación de '{file_name}': {source.node_id} -> {target.node_id}")
+                self.stats['replications_requested'] += 1
+                
+                # Esperar respuesta
+                length_data = sock.recv(8)
+                if length_data:
+                    msg_len = int(length_data.decode().strip())
+                    data = sock.recv(msg_len)
+                    response = json.loads(data.decode())
+                    
+                    if response.get('status') == 'success':
+                        self.logger.info(f"✅ Replicación exitosa de '{file_name}' a {target.node_id}")
+                        self.stats['replications_succeeded'] += 1
+                        # La confirmación final vendrá cuando el target notifique con file_stored
+                    else:
+                        error_msg = response.get('message', 'Unknown error')
+                        self.logger.error(f"❌ Replicación fallida de '{file_name}' a {target.node_id}: {error_msg}")
+                        self.stats['replications_failed'] += 1
+                        # Remover de en progreso para permitir reintento
+                        with self._replication_lock:
+                            self._replication_in_progress[file_name].discard(target.node_id)
+                else:
+                    self.logger.warning(f"⚠️ Sin respuesta de {source.node_id} para replicación de '{file_name}'")
+                    self.stats['replications_failed'] += 1
+                    with self._replication_lock:
+                        self._replication_in_progress[file_name].discard(target.node_id)
                 
         except Exception as e:
-            self.logger.debug(f"Error solicitando replicación: {e}")
+            self.logger.error(f"❌ Error solicitando replicación de '{file_name}' ({source.node_id} -> {target.node_id}): {e}")
+            self.stats['replications_failed'] += 1
+            # Remover de en progreso para permitir reintento
+            with self._replication_lock:
+                if file_name in self._replication_in_progress:
+                    self._replication_in_progress[file_name].discard(target.node_id)
     
     def _check_node_health(self, node: NodeInfo) -> bool:
         """Verifica si un nodo está vivo con un health check TCP"""

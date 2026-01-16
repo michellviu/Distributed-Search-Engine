@@ -26,6 +26,7 @@ from server.server import SearchServer, InMemoryDocumentRepository
 from indexer.indexer import DocumentIndexer
 from search.search_engine import SearchEngine
 from transfer.file_transfer import FileTransfer
+from client.coordinator_discovery import CoordinatorDiscovery
 
 
 class ProcessingNode:
@@ -50,6 +51,7 @@ class ProcessingNode:
                  host: str,
                  port: int,
                  index_path: str = 'shared_files',
+                 data_path: str = None,
                  coordinator_host: str = None,
                  coordinator_port: int = 5000,
                  announce_host: str = None):
@@ -60,8 +62,9 @@ class ProcessingNode:
             node_id: ID único del nodo
             host: IP para bind (0.0.0.0 para todas las interfaces)
             port: Puerto TCP
-            index_path: Directorio de archivos a indexar
-            coordinator_host: IP del coordinador
+            index_path: Directorio de archivos iniciales (lectura)
+            data_path: Directorio para almacenar archivos (escritura, por defecto = index_path)
+            coordinator_host: IP del coordinador (Semilla inicial)
             coordinator_port: Puerto del coordinador
             announce_host: IP para anunciarse al coordinador
         """
@@ -70,14 +73,24 @@ class ProcessingNode:
         self.port = port
         self.announce_host = announce_host or host
         self.index_path = index_path
+        # Directorio para almacenar archivos recibidos (puede ser diferente del index_path)
+        self.data_path = data_path or index_path
         
         self.coordinator_host = coordinator_host
         self.coordinator_port = coordinator_port
         
+        # Inicializar descubrimiento de coordinadores con la semilla proporcionada
+        initial_seeds = []
+        if coordinator_host:
+            initial_seeds.append(f"{coordinator_host}:{coordinator_port}")
+        
+        self.discovery = CoordinatorDiscovery(initial_seeds)
+        
         self.logger = logging.getLogger(f"ProcessingNode-{node_id}")
         
-        # Crear directorio de archivos si no existe
+        # Crear directorios si no existen
         Path(index_path).mkdir(parents=True, exist_ok=True)
+        Path(self.data_path).mkdir(parents=True, exist_ok=True)
         
         # Componentes de indexación y búsqueda
         self.indexer = DocumentIndexer(index_path)
@@ -122,6 +135,7 @@ class ProcessingNode:
         self.logger.info(f"   Host:        {self.host}:{self.port}")
         self.logger.info(f"   Announce:    {self.announce_host}:{self.port}")
         self.logger.info(f"   Index Path:  {self.index_path}")
+        self.logger.info(f"   Data Path:   {self.data_path}")
         if self.coordinator_host:
             self.logger.info(f"   Coordinator: {self.coordinator_host}:{self.coordinator_port}")
         self.logger.info("=" * 60)
@@ -156,12 +170,27 @@ class ProcessingNode:
     
     def _index_initial_files(self):
         """
-        Indexa los archivos existentes en el directorio.
+        Indexa los archivos existentes en los directorios.
         
-        Si hay coordinador configurado, consulta qué archivos debe indexar
-        para mantener el balanceo entre nodos. Si no hay coordinador o
-        falla la consulta, indexa todos los archivos locales.
+        Indexa desde:
+        1. data_path: Archivos previamente almacenados por este nodo
+        2. index_path: Archivos iniciales compartidos (si hay coordinador, pide asignación)
         """
+        # 1. Indexar archivos del data_path (archivos propios de este nodo)
+        if self.data_path != self.index_path:
+            data_dir = Path(self.data_path)
+            if data_dir.exists():
+                data_files = [f for f in data_dir.iterdir() if f.is_file()]
+                if data_files:
+                    self.logger.info(f"📦 Indexando {len(data_files)} archivos del directorio de datos...")
+                    for file_path in data_files:
+                        try:
+                            self.indexer.index_file(str(file_path))
+                            self.stats['files_indexed'] += 1
+                        except Exception as e:
+                            self.logger.error(f"Error indexando {file_path}: {e}")
+        
+        # 2. Indexar archivos del index_path (archivos compartidos iniciales)
         shared_dir = Path(self.index_path)
         if not shared_dir.exists():
             self.logger.warning(f"⚠️ Directorio {self.index_path} no existe")
@@ -171,10 +200,10 @@ class ProcessingNode:
         local_files = [f.name for f in shared_dir.iterdir() if f.is_file()]
         
         if not local_files:
-            self.logger.info("📁 No hay archivos locales para indexar")
+            self.logger.info("📁 No hay archivos iniciales para indexar")
             return
         
-        self.logger.info(f"📋 Archivos locales disponibles: {len(local_files)}")
+        self.logger.info(f"📋 Archivos iniciales disponibles: {len(local_files)}")
         
         # Si hay coordinador, consultar qué archivos debemos indexar
         files_to_index = local_files
@@ -198,7 +227,7 @@ class ProcessingNode:
                 except Exception as e:
                     self.logger.error(f"Error indexando {file_path}: {e}")
         
-        self.stats['files_indexed'] = count
+        self.stats['files_indexed'] += count
         self.logger.info(f"📁 Indexados {count} archivos del directorio {self.index_path}")
     
     def _request_file_assignment(self, available_files: List[str]) -> Optional[List[str]]:
@@ -422,8 +451,8 @@ class ProcessingNode:
             import base64
             file_content = base64.b64decode(file_content_b64)
             
-            # Guardar archivo
-            file_path = Path(self.index_path) / file_name
+            # Guardar archivo en data_path (directorio de almacenamiento)
+            file_path = Path(self.data_path) / file_name
             with open(file_path, 'wb') as f:
                 f.write(file_content)
             
@@ -493,10 +522,41 @@ class ProcessingNode:
         if not file_name or not target_host:
             return {'status': 'error', 'message': 'Missing file_name or target_host'}
         
-        # Verificar que tenemos el archivo
-        file_path = Path(self.index_path) / file_name
-        if not file_path.exists():
+        self.logger.info(f"📨 Recibida solicitud de replicación: '{file_name}' -> {target_node_id} ({target_host}:{target_port})")
+        
+        # Verificar que tenemos el archivo - buscar en múltiples ubicaciones
+        file_path = None
+        
+        # 1. Buscar en index_path directamente
+        candidate = Path(self.index_path) / file_name
+        if candidate.exists() and candidate.is_file():
+            file_path = candidate
+        
+        # 2. Buscar en data_path si es diferente
+        if not file_path and self.data_path != self.index_path:
+            candidate = Path(self.data_path) / file_name
+            if candidate.exists() and candidate.is_file():
+                file_path = candidate
+        
+        # 3. Buscar recursivamente en subdirectorios de index_path
+        if not file_path:
+            for candidate in Path(self.index_path).rglob(file_name):
+                if candidate.is_file():
+                    file_path = candidate
+                    break
+        
+        # 4. Buscar recursivamente en subdirectorios de data_path
+        if not file_path and self.data_path != self.index_path:
+            for candidate in Path(self.data_path).rglob(file_name):
+                if candidate.is_file():
+                    file_path = candidate
+                    break
+        
+        if not file_path:
+            self.logger.error(f"❌ Archivo '{file_name}' no encontrado en ninguna ubicación (index_path={self.index_path}, data_path={self.data_path})")
             return {'status': 'error', 'message': f'File not found: {file_name}'}
+        
+        self.logger.info(f"📁 Archivo encontrado en: {file_path}")
         
         # Leer contenido y enviar al nodo destino
         try:
@@ -530,16 +590,21 @@ class ProcessingNode:
                     response = json.loads(data.decode())
                     
                     if response.get('status') == 'success':
-                        self.logger.info(f"📤 Replicado '{file_name}' a {target_node_id}")
+                        self.logger.info(f"✅ Archivo '{file_name}' replicado exitosamente a {target_node_id}")
                         return {
                             'status': 'success',
                             'message': f'File replicated to {target_node_id}'
                         }
+                    else:
+                        error_msg = response.get('message', 'Unknown error')
+                        self.logger.error(f"❌ Fallo al replicar '{file_name}' a {target_node_id}: {error_msg}")
+                        return {'status': 'error', 'message': f'Target rejected: {error_msg}'}
             
+            self.logger.error(f"❌ Sin respuesta de {target_node_id} al replicar '{file_name}'")
             return {'status': 'error', 'message': 'No response from target node'}
             
         except Exception as e:
-            self.logger.error(f"Error replicando archivo: {e}")
+            self.logger.error(f"❌ Error replicando '{file_name}' a {target_node_id}: {e}")
             return {'status': 'error', 'message': str(e)}
     
     def _handle_list(self) -> dict:
@@ -615,17 +680,39 @@ class ProcessingNode:
         if not file_name:
             return {'status': 'error', 'message': 'Missing file_name'}
         
-        # Buscar archivo en el directorio de índice
-        file_path = Path(self.index_path) / file_name
+        # Buscar archivo en múltiples ubicaciones
+        file_path = None
         
-        if not file_path.exists():
-            # Intentar buscar en subdirectorios
-            for child in Path(self.index_path).rglob(file_name):
-                if child.is_file():
-                    file_path = child
+        # 1. Buscar en index_path directamente
+        candidate = Path(self.index_path) / file_name
+        if candidate.exists() and candidate.is_file():
+            file_path = candidate
+        
+        # 2. Buscar en data_path si es diferente
+        if not file_path and self.data_path != self.index_path:
+            candidate = Path(self.data_path) / file_name
+            if candidate.exists() and candidate.is_file():
+                file_path = candidate
+        
+        # 3. Buscar recursivamente en subdirectorios de index_path
+        if not file_path:
+            for candidate in Path(self.index_path).rglob(file_name):
+                if candidate.is_file():
+                    file_path = candidate
                     break
-            else:
-                return {'status': 'error', 'message': f'File not found: {file_name}'}
+        
+        # 4. Buscar recursivamente en subdirectorios de data_path
+        if not file_path and self.data_path != self.index_path:
+            for candidate in Path(self.data_path).rglob(file_name):
+                if candidate.is_file():
+                    file_path = candidate
+                    break
+        
+        if not file_path:
+            self.logger.error(f"❌ Archivo '{file_name}' no encontrado para descarga")
+            return {'status': 'error', 'message': f'File not found: {file_name}'}
+        
+        self.logger.debug(f"📁 Archivo encontrado para descarga en: {file_path}")
         
         try:
             with open(file_path, 'rb') as f:
@@ -666,32 +753,150 @@ class ProcessingNode:
         }
     
     def _coordinator_loop(self):
-        """Mantiene conexión con el coordinador"""
+        """Mantiene conexión con el coordinador (Líder) con soporte de failover"""
         # Esperar a que el servidor esté listo
         time.sleep(2)
         
         while self.active:
-            if not self.registered_with_coordinator:
-                # Intentar registrarse
-                success = self._register_with_coordinator()
-                if success:
-                    self.registered_with_coordinator = True
-                    self.logger.info("✅ Registrado con el coordinador")
-                else:
-                    self.logger.warning(
-                        f"⚠️ No se pudo registrar con coordinador. "
-                        f"Reintentando en {self.COORDINATOR_RETRY_INTERVAL}s..."
-                    )
-                    time.sleep(self.COORDINATOR_RETRY_INTERVAL)
-                    continue
+            # 1. Descubrir/Refrescar lista de coordinadores
+            self.discovery.refresh()
+            coordinators = self.discovery.get_coordinators()
             
-            # Enviar heartbeat
+            if not coordinators:
+                self.logger.warning("⚠️ No se han encontrado coordinadores. Reintentando descubrimiento...")
+                time.sleep(5)
+                continue
+
+            # 2. Intentar encontrar al líder
+            leader_found = False
+            
+            # Priorizar el último coordinador conocido si existe
+            if self.coordinator_host:
+                current_addr = f"{self.coordinator_host}:{self.coordinator_port}"
+                if current_addr in coordinators:
+                    # Mover al principio para probar primero
+                    coordinators.remove(current_addr)
+                    coordinators.insert(0, current_addr)
+
+            for coord_addr in coordinators:
+                try:
+                    host, port_str = coord_addr.split(':')
+                    port = int(port_str)
+                    
+                    self.logger.info(f"🔄 Intentando conectar con coordinador: {coord_addr}")
+                    
+                    # Verificar salud y liderazgo
+                    is_leader, redirect_host, redirect_port = self._check_coordinator_status(host, port)
+                    
+                    target_host, target_port = host, port
+                    
+                    if redirect_host:
+                        self.logger.info(f"↩️ Redirigido por coordinador hacia líder: {redirect_host}:{redirect_port}")
+                        target_host, target_port = redirect_host, redirect_port
+                        # Verificar conectividad con el líder redirigido
+                        is_leader, _, _ = self._check_coordinator_status(target_host, target_port)
+                    
+                    if is_leader:
+                        # Actualizar host actual
+                        self.coordinator_host = target_host
+                        self.coordinator_port = target_port
+                        
+                        # Intentar registrarse
+                        if self._register_with_coordinator():
+                            self.registered_with_coordinator = True
+                            self.logger.info(f"✅ Conectado y registrado con LÍDER: {target_host}:{target_port}")
+                            leader_found = True
+                            
+                            # SOLICITAR SINCRONIZACIÓN INICIAL:
+                            # Pedir al líder que nos envíe los archivos que nos faltan
+                            self._request_full_synchronization()
+                            
+                            # Mantener el loop de heartbeat mientras dure la conexión
+                            self._heartbeat_session()
+                            
+                            # Si salimos de heartbeat_session es porque perdimos conexión
+                            self.registered_with_coordinator = False
+                            self.logger.warning(f"❌ Conexión perdida con líder {target_host}:{target_port}")
+                            break # Salir del for para refrescar lista y buscar nuevo líder
+                        else:
+                            self.logger.warning(f"⚠️ Falló registro con {target_host}:{target_port}")
+                    else:
+                        self.logger.info(f"ℹ️ Coordinador {host}:{port} no es líder y no redirigió")
+
+                except Exception as e:
+                    self.logger.warning(f"⚠️ Error conectando a {coord_addr}: {e}")
+            
+            if not leader_found:
+                self.logger.warning("⚠️ No se pudo conectar a ningún líder. Reintentando en 5s...")
+                time.sleep(5)
+
+    def _check_coordinator_status(self, host: str, port: int) -> Tuple[bool, Optional[str], Optional[int]]:
+        """
+        Verifica si un coordinador es líder.
+        Returns: (is_leader, redirect_host, redirect_port)
+        """
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(3)
+                sock.connect((host, port))
+                
+                request = json.dumps({'action': 'health'})
+                sock.sendall(f"{len(request):<8}".encode() + request.encode())
+                
+                length_data = sock.recv(8)
+                if not length_data: return False, None, None
+                
+                length = int(length_data.decode().strip())
+                data = sock.recv(length)
+                response = json.loads(data.decode())
+                
+                current_leader = response.get('current_leader')
+                is_leader = response.get('is_leader', False)
+                return is_leader, None, None
+        except:
+            return False, None, None
+
+    def _heartbeat_session(self):
+        """Loop de heartbeats mientras la conexión esté activa"""
+        while self.active and self.registered_with_coordinator:
             if not self._send_heartbeat():
-                self.logger.warning("⚠️ Heartbeat fallido, reconectando...")
-                self.registered_with_coordinator = False
-            
+                return
             time.sleep(self.HEARTBEAT_INTERVAL)
-    
+
+    def _request_full_synchronization(self):
+        """Solicita sincronización completa de archivos al coordinador"""
+        if not self.coordinator_host:
+            return
+
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(30)
+                sock.connect((self.coordinator_host, self.coordinator_port))
+                
+                # Obtener archivos que ya tengo
+                my_files = self._get_indexed_file_names()
+                
+                request = {
+                    'action': 'request_sync',
+                    'node_id': self.node_id,
+                    'current_files': my_files
+                }
+                
+                req_json = json.dumps(request)
+                sock.sendall(f"{len(req_json):<8}".encode())
+                sock.sendall(req_json.encode())
+                
+                self.logger.info("📥 Solicitud de sincronización enviada al coordinador")
+                
+                # La respuesta vendrá asincrónicamente o como comandos de replicación
+                # pero podemos leer una confirmación simple
+                length_data = sock.recv(8)
+                if length_data:
+                    self.logger.info("✅ Coordinador inició proceso de sincronización")
+                
+        except Exception as e:
+            self.logger.warning(f"⚠️ Error solicitando sincronización: {e}")
+
     def _register_with_coordinator(self) -> bool:
         """Se registra con el coordinador"""
         if not self.coordinator_host:
@@ -724,6 +929,18 @@ class ProcessingNode:
                     msg_len = int(length_data.decode().strip())
                     data = sock.recv(msg_len)
                     response = json.loads(data.decode())
+                    
+                    # Manejar redirección explícita del coordinador
+                    if response.get('status') == 'redirect':
+                        lh = response.get('leader_host')
+                        lp = response.get('leader_port')
+                        if lh and lp:
+                            self.logger.info(f"↩️ Registro redirigido a: {lh}:{lp}")
+                            self.coordinator_host = lh
+                            self.coordinator_port = lp
+                            # Retornamos False para que el loop principal reintente con el nuevo host
+                            return False
+
                     return response.get('status') == 'success'
                 
         except Exception as e:
@@ -737,11 +954,22 @@ class ProcessingNode:
             files = self.repository.get_all_indexed_files()
             return [f.get('name', f.get('file_name', str(f))) for f in files]
         except:
-            # Fallback: listar archivos del directorio
+            # Fallback: listar archivos de ambos directorios
+            file_names = set()
             try:
-                return [f.name for f in Path(self.index_path).iterdir() if f.is_file()]
+                for f in Path(self.index_path).iterdir():
+                    if f.is_file():
+                        file_names.add(f.name)
             except:
-                return []
+                pass
+            try:
+                if self.data_path != self.index_path:
+                    for f in Path(self.data_path).iterdir():
+                        if f.is_file():
+                            file_names.add(f.name)
+            except:
+                pass
+            return list(file_names)
     
     def _send_heartbeat(self) -> bool:
         """Envía heartbeat al coordinador"""
@@ -795,7 +1023,8 @@ class ProcessingNode:
             True si el almacenamiento fue exitoso
         """
         try:
-            file_path = Path(self.index_path) / file_name
+            # Guardar archivo en data_path (directorio de almacenamiento)
+            file_path = Path(self.data_path) / file_name
             with open(file_path, 'wb') as f:
                 f.write(content)
             

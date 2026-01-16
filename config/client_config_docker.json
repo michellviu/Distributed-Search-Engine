@@ -1,9 +1,6 @@
 {
     "distributed": {
-        "coordinators": [
-            "coordinator1:5000",
-            "coordinator2:5000"
-        ],
+        "coordinators": [],
         "auto_reconnect": true,
         "reconnect_interval": 5
     },

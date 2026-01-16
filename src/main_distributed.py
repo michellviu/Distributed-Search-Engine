@@ -72,7 +72,10 @@ Ejemplos:
                         help='Puerto del coordinador')
     parser.add_argument('--index-path', type=str,
                         default=os.environ.get('INDEX_PATH', 'shared_files'),
-                        help='Directorio de archivos a indexar')
+                        help='Directorio de archivos iniciales (lectura)')
+    parser.add_argument('--data-path', type=str,
+                        default=os.environ.get('DATA_PATH'),
+                        help='Directorio para almacenar archivos (escritura, por defecto = index-path)')
     
     # Argumentos para cluster de coordinadores (Bully)
     parser.add_argument('--peer-coordinators', type=str,
@@ -119,6 +122,7 @@ Ejemplos:
                 host=args.host,
                 port=args.port,
                 index_path=args.index_path,
+                data_path=args.data_path,
                 coordinator_host=args.coordinator_host,
                 coordinator_port=args.coordinator_port,
                 announce_host=args.announce_host
