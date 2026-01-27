@@ -27,6 +27,19 @@ import socket
 import json
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Set
+import base64
+import hashlib
+import hmac
+import secrets
+
+# Intentar usar cryptography. Si no está, usar fallback XOR simple (débil).
+try:
+    from cryptography.fernet import Fernet, InvalidToken
+    _HAS_CRYPTO = True
+except Exception:
+    Fernet = None
+    InvalidToken = Exception
+    _HAS_CRYPTO = False
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
@@ -135,7 +148,10 @@ class CoordinatorNode:
         }
         
         self.logger.info(f"🎯 Coordinador inicializado: {coordinator_id}")
-    
+
+        # Inicializar criptografía (clave maestra)
+        self._init_crypto()
+
     def start(self):
         """Inicia el nodo coordinador"""
         self.active = True
@@ -998,44 +1014,20 @@ class CoordinatorNode:
         }
     
     def _query_processing_node(self, node: NodeInfo, query: str, file_type: str = None) -> List[dict]:
-        """Envía una query de búsqueda a un nodo de procesamiento"""
+        """Envía una query de búsqueda a un nodo de procesamiento (con cifrado)."""
         try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                sock.settimeout(10)
-                sock.connect((node.host, node.port))
-                
-                request = {
-                    'action': 'search_local',
-                    'query': query,
-                    'file_type': file_type
-                }
-                
-                req_json = json.dumps(request)
-                sock.sendall(f"{len(req_json):<8}".encode())
-                sock.sendall(req_json.encode())
-                
-                # Leer respuesta
-                length_data = sock.recv(8)
-                if not length_data:
-                    return []
-                
-                msg_len = int(length_data.decode().strip())
-                data = b''
-                while len(data) < msg_len:
-                    chunk = sock.recv(min(4096, msg_len - len(data)))
-                    if not chunk:
-                        break
-                    data += chunk
-                
-                response = json.loads(data.decode())
-                results = response.get('results', [])
-                
-                # Añadir nodo origen
-                for r in results:
-                    r['source_node'] = node.node_id
-                
-                return results
-                
+            request = {
+                'action': 'search_local',
+                'query': query,
+                'file_type': file_type
+            }
+            response = self._send_socket_request(node.host, node.port, request, node.node_id, timeout=10)
+            if not response:
+                return []
+            results = response.get('results', [])
+            for r in results:
+                r['source_node'] = node.node_id
+            return results
         except Exception as e:
             self.logger.debug(f"Error querying {node.node_id}: {e}")
             return []
@@ -1155,374 +1147,27 @@ class CoordinatorNode:
         }
     
     def _send_file_to_node(self, file_name: str, file_content: str, host: str, port: int, node_id: str) -> bool:
-        """Envía un archivo a un nodo de procesamiento"""
+        """Envía un archivo a un nodo de procesamiento (ahora usando cifrado)."""
         self.logger.info(f"📤 Intentando enviar '{file_name}' a {node_id} ({host}:{port})")
         try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                sock.settimeout(30)
-                sock.connect((host, port))
-                
-                request = {
-                    'action': 'store',
-                    'file_name': file_name,
-                    'file_content': file_content
-                }
-                
-                req_json = json.dumps(request)
-                sock.sendall(f"{len(req_json):<8}".encode())
-                sock.sendall(req_json.encode())
-                
-                # Leer respuesta
-                length_data = sock.recv(8)
-                if length_data:
-                    msg_len = int(length_data.decode().strip())
-                    response_data = b''
-                    while len(response_data) < msg_len:
-                        chunk = sock.recv(min(4096, msg_len - len(response_data)))
-                        if not chunk:
-                            break
-                        response_data += chunk
-                    
-                    response = json.loads(response_data.decode())
-                    if response.get('status') == 'success':
-                        self.logger.info(f"✅ Archivo '{file_name}' enviado exitosamente a {node_id}")
-                        return True
-                    else:
-                        self.logger.warning(f"⚠️ Nodo {node_id} respondió con error: {response}")
-                
+            request = {
+                'action': 'store',
+                'file_name': file_name,
+                'file_content': file_content
+            }
+            response = self._send_socket_request(host, port, request, node_id, timeout=30)
+            if response and response.get('status') == 'success':
+                self.logger.info(f"✅ Archivo '{file_name}' enviado exitosamente a {node_id}")
+                return True
+            else:
+                self.logger.warning(f"⚠️ Nodo {node_id} respondió con error o sin respuesta: {response}")
                 return False
-                
         except Exception as e:
             self.logger.warning(f"⚠️ Error enviando archivo a {node_id}: {e}")
             return False
     
-    def _handle_file_stored(self, request: dict) -> dict:
-        """
-        Confirma que un archivo fue almacenado en un nodo.
-        
-        Después de que un nodo de procesamiento almacena un archivo,
-        notifica al coordinador para actualizar el índice de ubicaciones.
-        """
-        file_name = request.get('file_name')
-        node_id = request.get('node_id')
-        
-        if not file_name or not node_id:
-            return {'status': 'error', 'message': 'Missing file_name or node_id'}
-        
-        self.registry.register_file_location(file_name, node_id)
-        self.stats['files_stored'] += 1
-        
-        # Remover de replicaciones en progreso
-        with self._replication_lock:
-            if file_name in self._replication_in_progress:
-                self._replication_in_progress[file_name].discard(node_id)
-                if not self._replication_in_progress[file_name]:
-                    del self._replication_in_progress[file_name]
-        
-        self.logger.info(f"📍 Confirmado: '{file_name}' almacenado en {node_id}")
-        
-        return {
-            'status': 'success',
-            'message': f'File location registered: {file_name} -> {node_id}'
-        }
-    
-    def _handle_get_nodes(self, request: dict) -> dict:
-        """Devuelve lista de nodos de procesamiento activos"""
-        nodes = self.registry.get_active_nodes(max_age_seconds=self.NODE_TIMEOUT)
-        
-        return {
-            'status': 'success',
-            'nodes': [n.to_dict() for n in nodes],
-            'count': len(nodes)
-        }
-
-    def _handle_get_coordinators(self, request: dict) -> dict:
-        """
-        Devuelve lista de coordinadores conocidos en el cluster.
-        Usado para descubrimiento dinámico por parte de clientes.
-        """
-        peers = []
-        
-        # Agregar este mismo coordinador
-        peers.append({
-            'coordinator_id': self.coordinator_id,
-            'host': self.announce_host,
-            'port': self.port,
-            'is_leader': self.cluster.is_leader(),
-            'role': self.cluster.role.value if hasattr(self.cluster, 'role') else 'UNKNOWN'
-        })
-        
-        # Agregar peers conocidos
-        if hasattr(self.cluster, 'peers'):
-            for peer_id, peer in self.cluster.peers.items():
-                peers.append({
-                    'coordinator_id': peer.coordinator_id,
-                    'host': peer.host,
-                    'port': peer.port,
-                    'is_leader': False, # Solo estimación
-                    'role': peer.role.value if hasattr(peer, 'role') else 'UNKNOWN'
-                })
-        
-        return {
-            'status': 'success',
-            'coordinators': peers,
-            'count': len(peers)
-        }
-    
-    def _handle_get_file_locations(self, request: dict) -> dict:
-        """Devuelve los nodos donde está almacenado un archivo"""
-        file_name = request.get('file_name')
-        
-        if not file_name:
-            return {'status': 'error', 'message': 'Missing file_name'}
-        
-        node_ids = self.registry.get_file_locations(file_name)
-        
-        nodes = []
-        for node_id in node_ids:
-            addr = self.registry.resolve(node_id)
-            if addr:
-                nodes.append({
-                    'node_id': node_id,
-                    'host': addr[0],
-                    'port': addr[1]
-                })
-        
-        return {
-            'status': 'success',
-            'file_name': file_name,
-            'nodes': nodes,
-            'count': len(nodes)
-        }
-    
-    def _handle_list(self, request: dict) -> dict:
-        """
-        Lista todos los archivos indexados en el sistema.
-        Compatible con la interfaz del cliente GUI.
-        """
-        try:
-            # Obtener todos los archivos del registro
-            all_files = self.registry.get_all_files()
-            
-            files = []
-            for file_name, node_ids in all_files.items():
-                files.append({
-                    'name': file_name,
-                    'replicas': len(node_ids),
-                    'nodes': list(node_ids)
-                })
-            
-            return {
-                'status': 'success',
-                'files': files,
-                'count': len(files)
-            }
-        except Exception as e:
-            self.logger.error(f"Error en list: {e}")
-            return {'status': 'error', 'message': str(e)}
-    
-    def _handle_download(self, request: dict) -> dict:
-        """
-        Descarga un archivo del sistema distribuido.
-        
-        1. Busca en qué nodos está el archivo
-        2. Lo descarga del primer nodo disponible
-        3. Devuelve el contenido en base64
-        """
-        import base64
-        
-        file_id = request.get('file_id') or request.get('file_name')
-        
-        if not file_id:
-            return {'status': 'error', 'message': 'Missing file_id'}
-        
-        # Obtener nodos que tienen el archivo
-        node_ids = self.registry.get_file_locations(file_id)
-        
-        if not node_ids:
-            return {'status': 'error', 'message': f'File not found: {file_id}'}
-        
-        # Intentar descargar de cada nodo hasta tener éxito
-        for node_id in node_ids:
-            addr = self.registry.resolve(node_id)
-            if not addr:
-                continue
-            
-            try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                    sock.settimeout(10)
-                    sock.connect((addr[0], addr[1]))
-                    
-                    # Pedir al nodo de procesamiento el archivo
-                    download_request = {
-                        'action': 'get_file',
-                        'file_name': file_id
-                    }
-                    
-                    self._send_to_socket(sock, download_request)
-                    response = self._receive_from_socket(sock)
-                    
-                    if response and response.get('status') == 'success':
-                        return {
-                            'status': 'success',
-                            'file_name': file_id,
-                            'file_content': response.get('file_content'),
-                            'file_size': response.get('file_size', 0)
-                        }
-                        
-            except Exception as e:
-                self.logger.debug(f"Error descargando de {node_id}: {e}")
-                continue
-        
-        return {'status': 'error', 'message': f'Could not download file from any node: {file_id}'}
-
-    def _handle_get_peers(self, request: dict, address: tuple) -> dict:
-        """Para compatibilidad con el sistema de discovery"""
-        # Registrar el nodo que pregunta si es un processing node
-        from_node = request.get('from_node')
-        from_host = request.get('from_host')
-        from_port = request.get('from_port', 5001)
-        from_type = request.get('from_type', 'processing')
-        
-        if from_node and from_host and from_type == 'processing':
-            self.registry.register_node(from_node, from_host, from_port)
-        
-        # Devolver lista de nodos conocidos
-        nodes = self.registry.get_all_nodes()
-        
-        return {
-            'status': 'success',
-            'node_id': self.coordinator_id,
-            'node_type': 'coordinator',
-            'peers': [n.to_dict() for n in nodes]
-        }
-    
-    def _heartbeat_loop(self):
-        """Verifica periódicamente la salud de los nodos de procesamiento"""
-        while self.active:
-            time.sleep(self.HEARTBEAT_INTERVAL)
-            
-            # Solo el líder gestiona la salud activa de los nodos
-            if not self.cluster.is_leader():
-                continue
-
-            nodes = self.registry.get_all_nodes()
-            current_time = time.time()
-            dead_nodes = []
-            
-            for node in nodes:
-                # Verificar si el nodo ha expirado
-                if (current_time - node.last_seen) > self.NODE_TIMEOUT:
-                    # Verificar con un health check directo
-                    if not self._check_node_health(node):
-                        dead_nodes.append(node)
-            
-            # Procesar nodos caídos
-            for node in dead_nodes:
-                self._handle_node_failure(node)
-    
-    def _handle_node_failure(self, node: NodeInfo):
-        """
-        Maneja la caída de un nodo de procesamiento.
-        
-        1. Elimina el nodo del registro
-        2. Identifica archivos que quedaron bajo el factor de replicación
-        3. Dispara re-replicación URGENTE de esos archivos
-        """
-        node_id = node.node_id
-        self.logger.warning(f"💀 Nodo de procesamiento perdido: {node_id}")
-        
-        # Obtener archivos que estaban en este nodo ANTES de eliminarlo
-        affected_files = list(node.files) if node.files else []
-        
-        # Eliminar nodo del registro
-        self.registry.unregister_node(node_id)
-        self.dns.unregister_node(node_id)
-        
-        # Verificar qué archivos necesitan re-replicación urgente
-        urgent_files = []
-        for file_name in affected_files:
-            current_locations = self.registry.get_file_locations(file_name)
-            if len(current_locations) < self.REPLICATION_FACTOR:
-                urgent_files.append((file_name, len(current_locations)))
-        
-        if urgent_files:
-            self.logger.warning(
-                f"⚠️ {len(urgent_files)} archivos necesitan re-replicación URGENTE"
-            )
-            # Disparar re-replicación en paralelo
-            self._urgent_replication(urgent_files)
-    
-    def _urgent_replication(self, files_to_replicate: List[tuple]):
-        """
-        Re-replica archivos de forma urgente después de la caída de un nodo.
-        
-        Args:
-            files_to_replicate: Lista de (file_name, current_replica_count)
-        """
-        threads = []
-        
-        for file_name, current_count in files_to_replicate:
-            t = threading.Thread(
-                target=self._request_replication,
-                args=(file_name, current_count),
-                daemon=True
-            )
-            t.start()
-            threads.append(t)
-        
-        # Esperar que termine la re-replicación (con timeout)
-        for t in threads:
-            t.join(timeout=30)
-        
-        self.logger.info(f"✅ Re-replicación urgente completada para {len(files_to_replicate)} archivos")
-    
-    def _replication_check_loop(self):
-        """Verifica periódicamente que los archivos tengan suficientes réplicas"""
-        while self.active:
-            time.sleep(5)  # Cada 5 segundos (más rápido para pruebas)
-            
-            # Solo el líder gestiona la replicación
-            if not self.cluster.is_leader():
-                continue
-
-            files_needing_replication = self.registry.get_files_needing_replication()
-            
-            if files_needing_replication:
-                self.logger.info(f"🔄 {len(files_needing_replication)} archivos necesitan más réplicas")
-                
-                for file_name, current_replicas in files_needing_replication:
-                    self._request_replication(file_name, current_replicas)
-    
-    def _request_replication(self, file_name: str, current_replicas: int):
-        """Solicita replicación adicional de un archivo"""
-        # Obtener nodos donde ya está el archivo
-        current_nodes = self.registry.get_file_locations(file_name)
-        if not current_nodes:
-            return
-        
-        # Obtener nodos candidatos para replicar
-        needed = self.REPLICATION_FACTOR - current_replicas
-        all_nodes = self.registry.get_active_nodes(max_age_seconds=self.NODE_TIMEOUT)
-        
-        candidates = [n for n in all_nodes if n.node_id not in current_nodes]
-        candidates.sort(key=lambda n: n.load)  # Menos cargados primero
-        
-        if not candidates:
-            return
-        
-        # Seleccionar nodo fuente y destinos
-        source_node_id = current_nodes[0]
-        source = self.registry.lookup(source_node_id)
-        
-        if not source:
-            return
-        
-        for target in candidates[:needed]:
-            self._trigger_replication(file_name, source, target)
-    
     def _trigger_replication(self, file_name: str, source: NodeInfo, target: NodeInfo):
-        """Solicita a un nodo que replique un archivo a otro nodo"""
+        """Solicita a un nodo que replique un archivo a otro nodo (envío cifrado)."""
         # Verificar si ya está en progreso
         with self._replication_lock:
             if file_name not in self._replication_in_progress:
@@ -1536,49 +1181,29 @@ class CoordinatorNode:
             self._replication_in_progress[file_name].add(target.node_id)
         
         try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                sock.settimeout(30)  # Aumentar timeout para archivos grandes
-                sock.connect((source.host, source.port))
-                
-                request = {
-                    'action': 'replicate_to',
-                    'file_name': file_name,
-                    'target_host': target.host,
-                    'target_port': target.port,
-                    'target_node_id': target.node_id
-                }
-                
-                req_json = json.dumps(request)
-                sock.sendall(f"{len(req_json):<8}".encode())
-                sock.sendall(req_json.encode())
-                
-                self.logger.info(f"📤 Solicitada replicación de '{file_name}': {source.node_id} -> {target.node_id}")
-                self.stats['replications_requested'] += 1
-                
-                # Esperar respuesta
-                length_data = sock.recv(8)
-                if length_data:
-                    msg_len = int(length_data.decode().strip())
-                    data = sock.recv(msg_len)
-                    response = json.loads(data.decode())
-                    
-                    if response.get('status') == 'success':
-                        self.logger.info(f"✅ Replicación exitosa de '{file_name}' a {target.node_id}")
-                        self.stats['replications_succeeded'] += 1
-                        # La confirmación final vendrá cuando el target notifique con file_stored
-                    else:
-                        error_msg = response.get('message', 'Unknown error')
-                        self.logger.error(f"❌ Replicación fallida de '{file_name}' a {target.node_id}: {error_msg}")
-                        self.stats['replications_failed'] += 1
-                        # Remover de en progreso para permitir reintento
-                        with self._replication_lock:
-                            self._replication_in_progress[file_name].discard(target.node_id)
-                else:
-                    self.logger.warning(f"⚠️ Sin respuesta de {source.node_id} para replicación de '{file_name}'")
-                    self.stats['replications_failed'] += 1
-                    with self._replication_lock:
-                        self._replication_in_progress[file_name].discard(target.node_id)
-                
+            request = {
+                'action': 'replicate_to',
+                'file_name': file_name,
+                'target_host': target.host,
+                'target_port': target.port,
+                'target_node_id': target.node_id
+            }
+            # Usar helper que encripta antes de enviar y desencripta la respuesta
+            response = self._send_socket_request(source.host, source.port, request, source.node_id, timeout=30)
+
+            self.logger.info(f"📤 Solicitada replicación de '{file_name}': {source.node_id} -> {target.node_id}")
+            self.stats['replications_requested'] += 1
+
+            if response and response.get('status') == 'success':
+                self.logger.info(f"✅ Replicación exitosa de '{file_name}' a {target.node_id}")
+                self.stats['replications_succeeded'] += 1
+                # La confirmación final vendrá cuando el target notifique con file_stored
+            else:
+                self.logger.error(f"❌ Replicación fallida de '{file_name}' a {target.node_id}: {response}")
+                self.stats['replications_failed'] += 1
+                # Remover de en progreso para permitir reintento
+                with self._replication_lock:
+                    self._replication_in_progress[file_name].discard(target.node_id)
         except Exception as e:
             self.logger.error(f"❌ Error solicitando replicación de '{file_name}' ({source.node_id} -> {target.node_id}): {e}")
             self.stats['replications_failed'] += 1
@@ -1586,25 +1211,14 @@ class CoordinatorNode:
             with self._replication_lock:
                 if file_name in self._replication_in_progress:
                     self._replication_in_progress[file_name].discard(target.node_id)
-    
+
     def _check_node_health(self, node: NodeInfo) -> bool:
-        """Verifica si un nodo está vivo con un health check TCP"""
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                sock.settimeout(3)
-                sock.connect((node.host, node.port))
-                
-                request = {'action': 'health'}
-                req_json = json.dumps(request)
-                sock.sendall(f"{len(req_json):<8}".encode())
-                sock.sendall(req_json.encode())
-                
-                length_data = sock.recv(8)
-                if length_data:
-                    self.registry.update_last_seen(node.node_id)
-                    return True
-        except:
-            pass
+        """Verifica si un nodo está vivo con un health check TCP (soporta respuesta cifrada)."""
+        request = {'action': 'health'}
+        response = self._send_socket_request(node.host, node.port, request, node.node_id, timeout=3)
+        if response and response.get('status') == 'ok':
+            self.registry.update_last_seen(node.node_id)
+            return True
         return False
     
     def _get_cluster_status(self) -> dict:
@@ -1669,3 +1283,110 @@ class CoordinatorNode:
         node = self.registry.lookup(node_id)
         if node and node.current_tasks > 0:
             self.registry.update_node_tasks(node_id, node.current_tasks - 1)
+    
+    # -----------------------
+    # CRYPTO HELPERS
+    # -----------------------
+    def _init_crypto(self):
+        """
+        Inicializa claves para cifrado. Usa una clave maestra (env COORD_MASTER_KEY)
+        o genera una si no está presente. Soporta Fernet si está instalado,
+        sino usa un fallback XOR simple.
+        """
+        env_key = os.environ.get('COORD_MASTER_KEY')
+        if env_key:
+            try:
+                # Esperar base64 urlsafe encoded para Fernet, si viene así
+                self._master_key = env_key.encode()
+            except Exception:
+                self._master_key = env_key.encode()
+        else:
+            # Generar clave aleatoria de 32 bytes
+            self._master_key = secrets.token_bytes(32)
+
+        self._use_fernet = _HAS_CRYPTO
+        if self._use_fernet:
+            # Nada más: derivaremos claves por nodo cuando haga falta
+            self.logger.debug("🔐 Fernet disponible: usando cifrado fuerte")
+        else:
+            self.logger.warning("⚠️ cryptography no disponible: usando fallback XOR (no seguro)")
+
+    def _derive_key(self, node_id: Optional[str]) -> bytes:
+        """
+        Deriva una clave simétrica basada en la master_key y el node_id.
+        Devuelve una clave urlsafe base64 de 32 bytes apta para Fernet.
+        """
+        node_bytes = (node_id or "").encode()
+        digest = hashlib.sha256(self._master_key + node_bytes).digest()
+        return base64.urlsafe_b64encode(digest)
+
+    def _encrypt_payload(self, data: dict, node_id: Optional[str] = None) -> str:
+        """Encripta un diccionario y devuelve base64/text para transporte."""
+        json_data = json.dumps(data).encode()
+        if self._use_fernet:
+            key = self._derive_key(node_id)
+            f = Fernet(key)
+            token = f.encrypt(json_data)
+            return token.decode()
+        else:
+            # Fallback XOR (débil): usar SHA256 como stream key
+            key_stream = hashlib.sha256(self._master_key + (node_id or "").encode()).digest()
+            xored = bytes([b ^ key_stream[i % len(key_stream)] for i, b in enumerate(json_data)])
+            return base64.b64encode(xored).decode()
+
+    def _decrypt_payload(self, token: str, node_id: Optional[str] = None) -> Optional[dict]:
+        """Desencripta una cadena y devuelve el dict, o None si falla."""
+        try:
+            if self._use_fernet:
+                key = self._derive_key(node_id)
+                f = Fernet(key)
+                plain = f.decrypt(token.encode())
+            else:
+                xored = base64.b64decode(token.encode())
+                key_stream = hashlib.sha256(self._master_key + (node_id or "").encode()).digest()
+                plain = bytes([b ^ key_stream[i % len(key_stream)] for i, b in enumerate(xored)])
+            return json.loads(plain.decode())
+        except (InvalidToken, Exception) as e:
+            self.logger.debug(f"🔓 Error desencriptando payload (maybe not encrypted): {e}")
+            return None
+
+    def _send_socket_request(self, host: str, port: int, request: dict, node_id: Optional[str] = None, timeout: int = 10) -> Optional[dict]:
+        """
+        Envía un request JSON a (host,port) con envoltura de cifrado y recibe respuesta,
+        desencriptando si aplica. Retorna dict o None.
+        """
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(timeout)
+                sock.connect((host, port))
+
+                # Encriptar request
+                try:
+                    encrypted = self._encrypt_payload(request, node_id)
+                    wrapper = {'encrypted': True, 'payload': encrypted}
+                except Exception as e:
+                    self.logger.debug(f"Error encrypting payload, sending plaintext: {e}")
+                    wrapper = request
+
+                # Enviar usando el mismo esquema de longitud
+                self._send_to_socket(sock, wrapper)
+
+                # Recibir respuesta
+                resp = self._receive_from_socket(sock)
+                if not isinstance(resp, dict):
+                    return None
+
+                # Si la respuesta está cifrada, desencriptar
+                if resp.get('encrypted') and 'payload' in resp:
+                    decrypted = self._decrypt_payload(resp['payload'], node_id)
+                    if decrypted is not None:
+                        return decrypted
+                    else:
+                        # Si no se pudo desencriptar, retornar el wrapper original para diagnóstico
+                        return resp
+                else:
+                    return resp
+
+        except Exception as e:
+            self.logger.debug(f"Error sending socket request to {host}:{port} - {e}")
+            return None
