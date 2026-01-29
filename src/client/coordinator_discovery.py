@@ -39,24 +39,28 @@ class DiscoveredCoordinator:
 
 class CoordinatorDiscovery:
     """
-    Descubrimiento automático de coordinadores en Docker Swarm.
+    Descubrimiento automático de coordinadores en Docker Networks.
     
-    Usa el servicio DNS de Docker para resolver el nombre del servicio
-    'search_coordinator' a todas las réplicas disponibles.
+    Usa el DNS interno de Docker para resolver el alias de red común
+    'coordinator' a todas las IPs de contenedores coordinadores.
     
-    En Docker Swarm (cliente dentro de Docker):
-    - search_coordinator → Resuelve a todas las IPs de las réplicas
+    En Docker Network (cliente dentro de Docker):
+    - 'coordinator' → Resuelve a todas las IPs de contenedores con ese alias
     
     Fuera de Docker (cliente en el host):
-    - Solo puede conectar a localhost:5000 (puerto expuesto)
-    - Docker Swarm balancea internamente entre coordinadores
+    - Solo puede conectar a localhost:puerto_expuesto
+    - Docker balancea internamente entre coordinadores
+    
+    Estrategia de descubrimiento:
+    1. Si está dentro de Docker: resolver 'coordinator' (alias común)
+    2. Si falla: usar direcciones hardcodeadas/persistidas
+    3. Si sigue fallando: usar localhost:5000
     """
     
-    # Nombre del servicio en Docker Swarm
-    DOCKER_SERVICE_NAME = "coordinator"
-    DOCKER_SERVICE_FQDN = "tasks.coordinator"
+    # Alias de red común para todos los coordinadores
+    DOCKER_NETWORK_ALIAS = "coordinator"
     
-    # Fallback para cliente fuera de Docker
+    # # Fallback para cliente fuera de Docker
     DEFAULT_HOST = "localhost"
     DEFAULT_PORT = 5000
     
@@ -71,18 +75,19 @@ class CoordinatorDiscovery:
         
         # Coordinadores conocidos
         self.coordinators: Set[str] = set()
-        self._is_inside_docker = self._check_if_inside_docker()
+        self._is_inside_docker = True#self._check_if_inside_docker()
+        self.logger.info(f"Cliente dentro de Docker: {self._is_inside_docker}")
         self._lock = threading.RLock()
         self._auto_discovery_enabled = False
         
         # Agregar direcciones iniciales
-        if initial_addresses:
-            for addr in initial_addresses:
-                # Limpiar y validar
-                if ":" in addr:
-                    self.coordinators.add(addr)
-                else:
-                    self.coordinators.add(f"{addr}:{self.DEFAULT_PORT}")
+        # if initial_addresses:
+        #     for addr in initial_addresses:
+        #         # Limpiar y validar
+        #         if ":" in addr:
+        #             self.coordinators.add(addr)
+        #         else:
+        #             self.coordinators.add(f"{addr}:{self.DEFAULT_PORT}")
         
         # Intentar descubrir automáticamente
         if self._is_inside_docker:
@@ -96,60 +101,76 @@ class CoordinatorDiscovery:
         
         self.logger.info(f"Coordinadores descubiertos: {self.coordinators}")
     
-    def _check_if_inside_docker(self) -> bool:
-        """Detecta si el cliente está corriendo dentro de Docker"""
-        try:
-            with open('/proc/1/cgroup', 'r') as f:
-                return 'docker' in f.read()
-        except:
-            pass
+    # def _check_if_inside_docker(self) -> bool:
+    #     """Detecta si el cliente está corriendo dentro de Docker"""
+    #     try:
+    #         with open('/proc/1/cgroup', 'r') as f:
+    #             return 'docker' in f.read()
+    #     except:
+    #         pass
         
-        try:
-            # Verificar si existe /.dockerenv
-            import os
-            return os.path.exists('/.dockerenv')
-        except:
-            pass
+    #     try:
+    #         # Verificar si existe /.dockerenv
+    #         import os
+    #         return os.path.exists('/.dockerenv')
+    #     except:
+    #         pass
         
-        return False
+    #     return False
     
     def _discover_from_docker_dns(self) -> bool:
         """
-        Descubre coordinadores usando Docker DNS.
+        Descubre coordinadores intentando resolver nombres de host conocidos.
         
-        Docker Swarm proporciona DNS interno que resuelve nombres de servicios
-        a todas las réplicas disponibles.
-        
-        NOTA: Solo funciona si el cliente está dentro del mismo overlay network.
+        Intenta resolver 'coordinator1', 'coordinator2', etc. hasta encontrar algunos.
+        Esto funciona dentro de Docker network donde los hostnames están disponibles.
         """
-        if not self._is_inside_docker:
-            self.logger.debug("Cliente fuera de Docker, saltando descubrimiento DNS")
-            return False
+        discovered = False
         
-        # Intentar con tasks.coordinator para obtener todas las réplicas
-        for hostname in [self.DOCKER_SERVICE_FQDN, self.DOCKER_SERVICE_NAME]:
+        # Intentar resolver nombres de coordinadores conocidos
+        for i in range(1, 20):  # coordinator1 to coordinator19
+            hostname = f"coordinator{i}"
             try:
                 ips = self._resolve_dns(hostname)
-                
                 if ips:
-                    for ip in ips:
-                        self.coordinators.add(f"{ip}:{self.DEFAULT_PORT}")
-                    self.logger.info(f"Descubiertas {len(ips)} réplicas de coordinador via Docker DNS ({hostname})")
-                    return True
-            except Exception as e:
-                self.logger.debug(f"No se pudo resolver {hostname}: {e}")
+                    # Usar la primera IP, asumir puerto estándar
+                    ip = ips[0]
+                    self.coordinators.add(f"{ip}:{self.DEFAULT_PORT}")
+                    discovered = True
+                    self.logger.debug(f"✓ Descubierto {hostname} → {ip}")
+            except:
+                # No se pudo resolver este hostname, continuar
+                pass
         
-        return False
+        if discovered:
+            self.logger.info(f"✅ Descubiertos coordinadores via hostname resolution: {self.get_coordinators()}")
+            return True
+        
+        # Fallback: intentar el alias común
+        try:
+            ips = self._resolve_dns(self.DOCKER_NETWORK_ALIAS)
+            if ips:
+                for ip in ips:
+                    if ip != '127.0.0.1' and ip != 'localhost':  # Evitar localhost
+                        self.coordinators.add(f"{ip}:{self.DEFAULT_PORT}")
+                        discovered = True
+        except:
+            pass
+        
+        return discovered
     
     def _resolve_dns(self, hostname: str) -> List[str]:
         """
-        Resuelve un hostname a lista de IPs.
+        Resuelve un hostname a lista de IPs usando Docker Network DNS.
         
-        En Docker Swarm, un nombre de servicio resuelve a múltiples IPs
-        (una por cada réplica).
+        En Docker networks, cuando múltiples contenedores tienen el mismo
+        network alias, el DNS resuelve a múltiples IPs (round-robin).
+        
+        Ejemplo con 3 coordinadores:
+            'coordinator' → ['10.0.1.5', '10.0.2.6', '10.0.3.7']
         """
         try:
-            # getaddrinfo retorna tuplas (family, type, proto, canonname, sockaddr)
+            # getaddrinfo puede retornar múltiples resultados para el mismo hostname
             results = socket.getaddrinfo(
                 hostname, 
                 self.DEFAULT_PORT, 
@@ -157,13 +178,16 @@ class CoordinatorDiscovery:
                 socket.SOCK_STREAM
             )
             
-            # Extraer IPs únicas
+            # Extraer IPs únicas (Docker puede retornar duplicados)
             ips = list(set(result[4][0] for result in results))
             
-            self.logger.debug(f"Resolvió {hostname} → {ips}")
+            self.logger.info(f"DEBUG: Resolved '{hostname}' to IPs: {ips}")
+            
+            if ips:
+                self.logger.debug(f"✓ Resolvió '{hostname}' → {ips}")
             return ips
         except socket.gaierror as e:
-            self.logger.debug(f"No se pudo resolver {hostname}: {e}")
+            self.logger.debug(f"✗ No se pudo resolver '{hostname}': {e}")
             raise
     
     def get_coordinators(self) -> List[str]:

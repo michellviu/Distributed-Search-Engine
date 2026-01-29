@@ -22,6 +22,7 @@ import socket
 import threading
 import time
 import logging
+import random
 from typing import Dict, List, Optional, Set
 from dataclasses import dataclass, field
 from enum import Enum
@@ -178,6 +179,11 @@ class CoordinatorCluster:
                 is_alive=True,
                 last_seen=time.time()
             )
+            # Disparar una nueva elección cuando se añade un nuevo coordinador
+            # para asegurarnos de que el cluster reevalúe quién debe ser líder.
+            if self.active and not self._election_in_progress:
+                self.logger.info(f"🔔 Nuevo peer {coordinator_id} añadido — lanzando elección para reevaluar líder")
+                threading.Thread(target=self._start_election, daemon=True).start()
         else:
             # Actualizar info si ya existe
             peer = self.peers[coordinator_id]
@@ -187,6 +193,9 @@ class CoordinatorCluster:
                 peer.port = port
                 peer.is_alive = True
                 peer.last_seen = time.time()
+                # Si cambia la información de un peer conocido, reevalúa liderazgo
+                if self.active and not self._election_in_progress:
+                    threading.Thread(target=self._start_election, daemon=True).start()
 
     def _add_peer_from_address(self, address: str):
         """Añade un peer desde una dirección 'host:port'"""
@@ -216,11 +225,17 @@ class CoordinatorCluster:
         # Descubrir IDs reales de los peers antes de iniciar elección
         self._discover_peer_ids()
         
+        # Obtener lista completa de coordinadores de un peer conocido
+        self._initial_peer_discovery()
+        
         # Iniciar heartbeat a otros coordinadores
         threading.Thread(target=self._peer_heartbeat_loop, daemon=True).start()
         
         # Iniciar verificación de líder
         threading.Thread(target=self._leader_check_loop, daemon=True).start()
+        
+        # Iniciar descubrimiento de peers
+        threading.Thread(target=self._discover_peers_loop, daemon=True).start()
         
         # Intentar elección inicial después de un delay para que los peers estén listos
         threading.Timer(3.0, self._start_election).start()
@@ -236,6 +251,27 @@ class CoordinatorCluster:
                 pass
         
         self.logger.info(f"🔍 Peers actuales: {list(self.peers.keys())}")
+    
+    def _initial_peer_discovery(self):
+        """Descubre la lista completa de coordinadores consultando a un peer conocido"""
+        if not self.peers:
+            return
+        
+        # Tomar el primer peer conocido
+        peer = next(iter(self.peers.values()))
+        try:
+            response = self._send_request_to_peer(peer, {'action': 'get_coordinators'})
+            if response and response.get('status') == 'success':
+                coords = response.get('coordinators', [])
+                for c in coords:
+                    c_id = c.get('coordinator_id')
+                    c_host = c.get('host')
+                    c_port = c.get('port')
+                    if c_id != self.coordinator_id and c_id not in self.peers:
+                        self.add_peer(c_id, c_host, c_port)
+                        self.logger.info(f"🆕 Descubierto peer inicial: {c_id} ({c_host}:{c_port})")
+        except Exception as e:
+            self.logger.debug(f"Error en descubrimiento inicial de peers: {e}")
     
     def stop(self):
         """Detiene el cluster manager"""
@@ -296,27 +332,29 @@ class CoordinatorCluster:
         # Persistir estado
         self._save_state()
     
-    def _send_state_to_peer(self, peer: CoordinatorPeer, snapshot: StateSnapshot):
-        """Envía snapshot de estado a un peer"""
+    def _send_request_to_peer(self, peer: CoordinatorPeer, request: dict) -> Optional[dict]:
+        """Envía una request a un peer y retorna la response"""
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.settimeout(5)
                 sock.connect((peer.host, peer.port))
                 
-                request = {
-                    'action': 'replicate_state',
-                    'from_coordinator': self.coordinator_id,
-                    'state': snapshot.to_dict()
-                }
-                
                 req_json = json.dumps(request)
                 sock.sendall(f"{len(req_json):<8}".encode())
                 sock.sendall(req_json.encode())
                 
-                self.logger.debug(f"📤 Estado replicado a {peer.coordinator_id}")
+                # Leer respuesta
+                length_data = sock.recv(8)
+                if length_data:
+                    msg_len = int(length_data.decode().strip())
+                    data = sock.recv(msg_len)
+                    response = json.loads(data.decode())
+                    return response
                 
         except Exception as e:
-            self.logger.debug(f"Error replicando estado a {peer.coordinator_id}: {e}")
+            self.logger.debug(f"Error sending request to {peer.coordinator_id}: {e}")
+        
+        return None
     
     def handle_state_replication(self, from_coordinator: str, state_data: dict) -> bool:
         """
@@ -415,11 +453,14 @@ class CoordinatorCluster:
     
     def _start_election(self):
         """
-        Inicia proceso de elección de líder usando algoritmo BULLY.
+        Inicia proceso de elección de líder usando algoritmo BULLY modificado.
+        
+        Para asegurar que todos los coordinadores participen, enviamos ELECTION a todos los peers conocidos.
+        El nodo con el ID más alto será el líder.
         
         Algoritmo:
-        1. Enviar ELECTION a todos los nodos con ID mayor
-        2. Si recibe OK de alguno, esperar COORDINATOR
+        1. Enviar ELECTION a todos los peers conocidos
+        2. Si recibe OK de alguno (hay alguien con mayor ID), esperar COORDINATOR
         3. Si no recibe OK (timeout), declararse líder y enviar COORDINATOR
         """
         if self._election_in_progress:
@@ -427,23 +468,22 @@ class CoordinatorCluster:
         
         self._election_in_progress = True
         self.role = CoordinatorRole.CANDIDATE
-        self.logger.info("🗳️ [BULLY] Iniciando elección de líder...")
+        self.logger.info("🗳️ [BULLY] Iniciando elección de líder entre todos los peers conocidos...")
         
         try:
-            # Paso 1: Enviar ELECTION a todos los nodos con ID MAYOR
-            higher_peers = [
-                peer for peer_id, peer in self.peers.items()
-                if peer_id > self.coordinator_id and peer.is_alive
+            # Paso 1: Enviar ELECTION a TODOS los peers conocidos (no solo higher)
+            known_peers = [
+                peer for peer in self.peers.values()
+                if peer.is_alive
             ]
             
-            if not higher_peers:
-                # No hay nadie con mayor ID, somos el líder
-                self.logger.info("🗳️ [BULLY] No hay nodos con mayor ID, soy el líder")
+            if not known_peers:
+                # No hay peers conocidos, somos el líder por defecto
                 self._become_leader()
                 return
             
-            # Enviar ELECTION a nodos con mayor ID
-            self.logger.info(f"🗳️ [BULLY] Enviando ELECTION a {len(higher_peers)} nodos con mayor ID")
+            # Enviar ELECTION a todos los peers conocidos
+            self.logger.info(f"🗳️ [BULLY] Enviando ELECTION a {len(known_peers)} peers conocidos")
             received_ok = False
             ok_lock = threading.Lock()
             
@@ -464,7 +504,7 @@ class CoordinatorCluster:
             
             # Enviar en paralelo
             threads = []
-            for peer in higher_peers:
+            for peer in known_peers:
                 t = threading.Thread(target=send_election, args=(peer,))
                 t.start()
                 threads.append(t)
@@ -559,18 +599,28 @@ class CoordinatorCluster:
         msg_type = BullyMessage(message_type)
         
         if msg_type == BullyMessage.ELECTION:
-            # Alguien con menor ID está iniciando elección
-            # Responder OK y empezar nuestra propia elección
-            self.logger.info(f"🗳️ [BULLY] Recibido ELECTION de {from_id}")
-            
-            # Iniciar nuestra propia elección (en otro thread para no bloquear)
-            threading.Thread(target=self._start_election, daemon=True).start()
-            
-            return {
-                'status': 'ok',
-                'message_type': BullyMessage.OK.value,
-                'from_coordinator': self.coordinator_id
-            }
+            # Alguien está iniciando elección
+            # Si el que envía tiene menor ID, responder OK y empezar nuestra propia elección
+            # Solo respondemos OK si nosotros tenemos mayor ID que el que inició
+            # la elección. En ese caso iniciamos nuestra propia elección para
+            # también competir y anunciarnos si corresponde.
+            try:
+                if self.coordinator_id > from_id:
+                    self.logger.info(f"🗳️ [BULLY] Recibido ELECTION de {from_id} (ID menor), respondiendo OK e iniciando elección propia")
+                    threading.Thread(target=self._start_election, daemon=True).start()
+                    return {
+                        'status': 'ok',
+                        'message_type': BullyMessage.OK.value,
+                        'from_coordinator': self.coordinator_id
+                    }
+                else:
+                    # Si nosotros NO tenemos mayor ID, no respondemos OK; el
+                    # iniciador seguirá esperando COORDINATOR de alguien con
+                    # mayor ID.
+                    self.logger.info(f"🗳️ [BULLY] Recibido ELECTION de {from_id} (ID mayor o igual), no respondo OK")
+                    return {'status': 'ok'}
+            except Exception:
+                return {'status': 'ok'}
         
         elif msg_type == BullyMessage.COORDINATOR:
             # Nuevo líder anunciado
@@ -697,6 +747,30 @@ class CoordinatorCluster:
             
         except Exception as e:
             self.logger.error(f"Error cargando estado: {e}")
+    
+    def _discover_peers_loop(self):
+        """Descubre nuevos peers consultando a los conocidos (gossip protocol)"""
+        while self.active:
+            time.sleep(10)  # Cada 10 segundos
+            
+            if self.peers:
+                # Elegir un peer aleatorio para consultar
+                peer = random.choice(list(self.peers.values()))
+                if peer.is_alive:
+                    try:
+                        # Consultar lista de coordinadores
+                        response = self._send_request_to_peer(peer, {'action': 'get_coordinators'})
+                        if response and response.get('status') == 'success':
+                            coords = response.get('coordinators', [])
+                            for c in coords:
+                                c_id = c.get('coordinator_id')
+                                c_host = c.get('host')
+                                c_port = c.get('port')
+                                if c_id != self.coordinator_id and c_id not in self.peers:
+                                    self.add_peer(c_id, c_host, c_port)
+                                    self.logger.debug(f"🆕 Descubierto peer via gossip: {c_id} ({c_host}:{c_port})")
+                    except Exception as e:
+                        self.logger.debug(f"Error discovering peers from {peer.coordinator_id}: {e}")
     
     def get_cluster_status(self) -> dict:
         """Obtiene estado del cluster de coordinadores"""

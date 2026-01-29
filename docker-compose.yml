@@ -22,7 +22,9 @@ services:
     ports:
       - "5000:5000"
     networks:
-      - search-network
+      search-network:
+        aliases:
+          - coordinator
     deploy:
       replicas: 1
       placement:
@@ -52,7 +54,9 @@ services:
       # Mapeamos 5001 del host al 5000 del contenedor
       - "5001:5000"
     networks:
-      - search-network
+      search-network:
+        aliases:
+          - coordinator
     deploy:
       replicas: 1
       placement:

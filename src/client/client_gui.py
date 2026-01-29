@@ -223,6 +223,9 @@ class DistributedClient:
         
         # Descubrimiento automático cada 30 segundos
         self.discovery.start_auto_discovery(interval=30)
+        
+        # Actualizar lista de coordinadores consultando al cluster
+        self._discover_coordinators_from_cluster()
     
     def add_manual_coordinator(self, host: str, port: int) -> bool:
         """Agrega un coordinador manualmente e intenta conectar"""
@@ -329,6 +332,10 @@ class DistributedClient:
         
         coord.is_alive = False
         coord.failures += 1
+        
+        # Si falla, actualizar la lista de coordinadores consultando otros
+        self._discover_coordinators_from_cluster()
+        
         return False
     
     def _health_check_loop(self):
@@ -343,9 +350,13 @@ class DistributedClient:
             if self.current_coordinator:
                 if not self._check_coordinator_health(self.current_coordinator):
                     self._find_active_coordinator()
-                # Si el actual no es líder, intentar conectar al líder
-                elif not self.current_coordinator.is_leader:
-                    self._find_active_coordinator()
+                else:
+                    # Preguntar al coordinador actual quién es el líder
+                    leader = self._ask_for_leader(self.current_coordinator)
+                    if leader and leader != self.current_coordinator:
+                        if self._check_coordinator_health(leader):
+                            self.logger.info(f"🔄 Cambiando a nuevo líder: {leader.address}")
+                            self.current_coordinator = leader
             
             for coord in self.coordinators:
                 if coord != self.current_coordinator:

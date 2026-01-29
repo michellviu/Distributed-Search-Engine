@@ -51,6 +51,7 @@ docker network inspect $NETWORK >/dev/null 2>&1 || docker network create $NETWOR
 docker run -d \
     --name "$CONTAINER_NAME" \
     --network "$NETWORK" \
+    --network-alias coordinator \
     --restart no \
     -p "$PORT:5000" \
     -v "$(pwd)/logs:/home/app/logs" \

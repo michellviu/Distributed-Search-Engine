@@ -32,6 +32,7 @@ RUN mkdir -p logs downloads
 # Variables de entorno por defecto
 ENV PYTHONUNBUFFERED=1
 ENV DISPLAY=:0
+ENV PYTHONPATH=/home/app/src
 
 # Comando por defecto
 CMD ["python3", "src/client/client_gui.py", "--config", "config/client_config.json"]

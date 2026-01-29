@@ -56,11 +56,11 @@ El sistema implementa una arquitectura **Coordinador/Nodos de Procesamiento** do
 - **Quorum**: Consistencia configurable (ONE, QUORUM, ALL)
 - **Docker Swarm**: Reinicio automático de servicios caídos
 
-### 🔍 Funcionalidades
-- **Búsqueda Distribuida**: Consultas optimizadas usando índice de ubicaciones
-- **Indexación Automática**: Al iniciar, cada nodo indexa sus archivos locales
-- **Descarga Resiliente**: Obtener archivos desde cualquier réplica disponible
-- **Filtrado por Tipo**: Búsqueda por extensión de archivo
+### 🔍 Descubrimiento Dinámico
+- **DNS Docker**: Coordinadores comparten alias `coordinator` en la red
+- **Auto-descubrimiento**: Cliente encuentra coordinadores automáticamente
+- **Failover**: Cambio automático entre coordinadores disponibles
+- **Escalabilidad**: Agregar coordinadores sin reconfigurar clientes
 
 ## Estructura del Proyecto
 
@@ -152,6 +152,40 @@ python -m src.client.client_gui
 ./start_client_gui.sh
 ```
 
+### Opción 3: Contenedores Manuales con Descubrimiento Dinámico
+
+Esta opción permite escalar el sistema levantando contenedores individuales con descubrimiento automático:
+
+```bash
+# Crear red Docker
+docker network create search-network
+
+# Levantar primer coordinador (semilla)
+./manual_add_coordinator.sh 1 5000
+
+# Levantar segundo coordinador (se conecta al primero)
+./manual_add_coordinator.sh 2 5001 coordinator1:5000
+
+# Levantar nodos de procesamiento
+./manual_add_node.sh 1 5002 coordinator1
+./manual_add_node.sh 2 5003 coordinator1
+
+# Levantar cliente (descubre coordinadores automáticamente)
+./start_client_docker.sh
+
+# Probar el sistema de descubrimiento
+./test_dynamic_discovery.sh
+
+# Probar el sistema completo (múltiples coordinadores)
+./test_full_system.sh
+```
+
+**Ventajas:**
+- ✅ **Escalabilidad**: Agrega coordinadores sin reconfigurar nada
+- ✅ **Descubrimiento automático**: El cliente encuentra coordinadores vía DNS Docker
+- ✅ **Failover**: Si un coordinador falla, el cliente cambia automáticamente
+- ✅ **Simplicidad**: No necesitas saber las IPs de los coordinadores
+
 ## Componentes del Sistema
 
 ### 1. CoordinatorNode (`src/distributed/node/coordinator_node.py`)
@@ -212,6 +246,7 @@ Todas las comunicaciones usan TCP con formato:
 - 📄 [REPORT.md](REPORT.md) - Informe técnico detallado
 - 🐳 [docs/DOCKER_SWARM_DEPLOY.md](docs/DOCKER_SWARM_DEPLOY.md) - Guía de Docker Swarm
 - 🖥️ [docs/GUI_CLIENT.md](docs/GUI_CLIENT.md) - Uso del cliente gráfico
+- 🔍 [docs/DYNAMIC_DISCOVERY.md](docs/DYNAMIC_DISCOVERY.md) - Sistema de descubrimiento dinámico
 
 ## Licencia
 
