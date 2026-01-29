@@ -1390,3 +1390,60 @@ class CoordinatorNode:
         except Exception as e:
             self.logger.debug(f"Error sending socket request to {host}:{port} - {e}")
             return None
+   
+    def _heartbeat_loop(self):
+        """
+        Loop que monitorea nodos de procesamiento activos.
+        Detecta nuevos nodos y nodos caídos comparando con el conjunto previo.
+        No elimina nada por sí mismo a menos que el registry exponga un método compatible.
+        """
+        prev_active: Set[str] = set()
+        interval = max(1, self.HEARTBEAT_INTERVAL)
+        while self.active:
+            try:
+                time.sleep(interval)
+                # Obtener nodos activos según el registry (que ya soporta max_age_seconds)
+                try:
+                    active_nodes = self.registry.get_active_nodes(max_age_seconds=self.NODE_TIMEOUT)
+                    active_ids = set([n.node_id for n in active_nodes])
+                except Exception:
+                    # Como fallback, intentar obtener todos los nodos y filtrar por last_seen si existe
+                    active_ids = set()
+                    all_nodes = []
+                    try:
+                        all_nodes = self.registry.get_all_nodes()
+                    except Exception:
+                        all_nodes = []
+                    now = time.time()
+                    for n in all_nodes:
+                        last = getattr(n, 'last_seen', None)
+                        if last is None:
+                            # Si no hay last_seen, asumir activo
+                            active_ids.add(n.node_id)
+                        else:
+                            if (now - last) <= self.NODE_TIMEOUT:
+                                active_ids.add(n.node_id)
+
+                # Detectar cambios
+                lost = prev_active - active_ids
+                new = active_ids - prev_active
+
+                for nid in new:
+                    self.logger.info(f"💚 Nodo activo detectado: {nid}")
+
+                for nid in lost:
+                    self.logger.warning(f"❌ Nodo no responde / timed out: {nid}")
+                    # Intentar llamar a un método de registry para marcar/remover nodo si existe
+                    try:
+                        if hasattr(self.registry, 'mark_node_offline'):
+                            self.registry.mark_node_offline(nid)
+                        elif hasattr(self.registry, 'remove_node'):
+                            self.registry.remove_node(nid)
+                    except Exception:
+                        # No es crítico; sólo loguear
+                        self.logger.debug(f"No se pudo marcar/remover nodo {nid} en registry")
+
+                prev_active = active_ids
+
+            except Exception as e:
+                self.logger.debug(f"Error en heartbeat loop: {e}")
