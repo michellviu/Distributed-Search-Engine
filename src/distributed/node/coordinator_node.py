@@ -148,10 +148,9 @@ class CoordinatorNode:
         }
         
         self.logger.info(f"🎯 Coordinador inicializado: {coordinator_id}")
-
         # Inicializar criptografía (clave maestra)
         self._init_crypto()
-
+        
     def start(self):
         """Inicia el nodo coordinador"""
         self.active = True
@@ -501,8 +500,19 @@ class CoordinatorNode:
         
         # Registrar los archivos que el nodo tiene
         for file_name in files:
-            self.registry.register_file_location(file_name, node_id)
+            # Intentar mapear nombre encriptado a original si aplica
+            mapped = self._map_encrypted_to_original(file_name) if file_name else None
+            if mapped:
+                self.registry.register_file_location(mapped, node_id)
+            else:
+                self.registry.register_file_location(file_name, node_id)
         
+        # Normalizar y limpiar entradas encriptadas (evita duplicados en el índice)
+        try:
+            self._cleanup_encrypted_entries()
+        except Exception:
+            pass
+
         self.logger.info(f"📝 Nodo de procesamiento registrado: {node_id} ({host}:{port}) - {len(files)} archivos")
         
         return {
@@ -984,6 +994,12 @@ class CoordinatorNode:
         
         self.logger.info(f"🔍 Búsqueda: '{query}' (tipo: {file_type or 'any'})")
         
+        # Asegurar que no tengamos entradas duplicadas antes de buscar
+        try:
+            self._cleanup_encrypted_entries()
+        except Exception:
+            pass
+
         # Búsqueda LOCAL en el registro del coordinador
         # No necesitamos consultar nodos porque solo buscamos por nombre
         results = self.registry.search_files(query, file_type)
@@ -1014,20 +1030,44 @@ class CoordinatorNode:
         }
     
     def _query_processing_node(self, node: NodeInfo, query: str, file_type: str = None) -> List[dict]:
-        """Envía una query de búsqueda a un nodo de procesamiento (con cifrado)."""
+        """Envía una query de búsqueda a un nodo de procesamiento"""
         try:
-            request = {
-                'action': 'search_local',
-                'query': query,
-                'file_type': file_type
-            }
-            response = self._send_socket_request(node.host, node.port, request, node.node_id, timeout=10)
-            if not response:
-                return []
-            results = response.get('results', [])
-            for r in results:
-                r['source_node'] = node.node_id
-            return results
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(10)
+                sock.connect((node.host, node.port))
+                
+                request = {
+                    'action': 'search_local',
+                    'query': query,
+                    'file_type': file_type
+                }
+                
+                req_json = json.dumps(request)
+                sock.sendall(f"{len(req_json):<8}".encode())
+                sock.sendall(req_json.encode())
+                
+                # Leer respuesta
+                length_data = sock.recv(8)
+                if not length_data:
+                    return []
+                
+                msg_len = int(length_data.decode().strip())
+                data = b''
+                while len(data) < msg_len:
+                    chunk = sock.recv(min(4096, msg_len - len(data)))
+                    if not chunk:
+                        break
+                    data += chunk
+                
+                response = json.loads(data.decode())
+                results = response.get('results', [])
+                
+                # Añadir nodo origen
+                for r in results:
+                    r['source_node'] = node.node_id
+                
+                return results
+                
         except Exception as e:
             self.logger.debug(f"Error querying {node.node_id}: {e}")
             return []
@@ -1147,27 +1187,435 @@ class CoordinatorNode:
         }
     
     def _send_file_to_node(self, file_name: str, file_content: str, host: str, port: int, node_id: str) -> bool:
-        """Envía un archivo a un nodo de procesamiento (ahora usando cifrado)."""
+        """Envía un archivo a un nodo de procesamiento (coordina cifrado del contenido)"""
         self.logger.info(f"📤 Intentando enviar '{file_name}' a {node_id} ({host}:{port})")
         try:
-            request = {
-                'action': 'store',
-                'file_name': file_name,
-                'file_content': file_content
-            }
-            response = self._send_socket_request(host, port, request, node_id, timeout=30)
-            if response and response.get('status') == 'success':
-                self.logger.info(f"✅ Archivo '{file_name}' enviado exitosamente a {node_id}")
-                return True
-            else:
-                self.logger.warning(f"⚠️ Nodo {node_id} respondió con error o sin respuesta: {response}")
+            # file_content expected base64 from client -> decode
+            try:
+                raw_bytes = base64.b64decode(file_content.encode())
+            except Exception:
+                raw_bytes = file_content.encode()  # fallback, treat as raw bytes string
+
+            # Cifrar el contenido con la clave maestra (mismo ciphertext para todas las réplicas)
+            encrypted_content = self._encrypt_bytes(raw_bytes)  # devuelve base64/text
+
+            # Nombre determinístico (para que el nodo lo use como key para almacenamiento)
+            encrypted_name = self._encrypt_filename(file_name)
+
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(30)
+                sock.connect((host, port))
+                
+                request = {
+                    'action': 'store',
+                    'file_name': encrypted_name,
+                    'file_content': encrypted_content,
+                    # incluir nombre original por compatibilidad si el nodo lo quiere notificar luego
+                    'original_file_name': file_name,
+                    'encrypted_by_coord': True
+                }
+                
+                req_json = json.dumps(request)
+                sock.sendall(f"{len(req_json):<8}".encode())
+                sock.sendall(req_json.encode())
+                
+                # Leer respuesta
+                length_data = sock.recv(8)
+                if length_data:
+                    msg_len = int(length_data.decode().strip())
+                    response_data = b''
+                    while len(response_data) < msg_len:
+                        chunk = sock.recv(min(4096, msg_len - len(response_data)))
+                        if not chunk:
+                            break
+                        response_data += chunk
+                    
+                    response = json.loads(response_data.decode())
+                    if response.get('status') == 'success':
+                        self.logger.info(f"✅ Archivo '{file_name}' enviado exitosamente a {node_id}")
+                        return True
+                    else:
+                        self.logger.warning(f"⚠️ Nodo {node_id} respondió con error: {response}")
+                
                 return False
+                
         except Exception as e:
             self.logger.warning(f"⚠️ Error enviando archivo a {node_id}: {e}")
             return False
     
+    def _handle_file_stored(self, request: dict) -> dict:
+        """
+        Confirma que un archivo fue almacenado en un nodo.
+        
+        Después de que un nodo de procesamiento almacena un archivo,
+        notifica al coordinador para actualizar el índice de ubicaciones.
+        """
+        file_name = request.get('file_name')
+        node_id = request.get('node_id')
+        original_provided = request.get('original_file_name')  # si el nodo nos da el nombre original
+
+        if not file_name or not node_id:
+            return {'status': 'error', 'message': 'Missing file_name or node_id'}
+
+        # Preferir nombre original si fue enviado por el nodo
+        if original_provided:
+            original_name = original_provided
+        else:
+            # Intentar mapear nombre cifrado a nombre original conocido
+            mapped = self._map_encrypted_to_original(file_name)
+            original_name = mapped if mapped else file_name
+
+        # Registrar usando el NOMBRE ORIGINAL (el índice del coordinador debe permanecer sin cifrar)
+        self.registry.register_file_location(original_name, node_id)
+        self.stats['files_stored'] += 1
+
+        # Remover de replicaciones en progreso usando el nombre original (si existe)
+        with self._replication_lock:
+            if original_name in self._replication_in_progress:
+                self._replication_in_progress[original_name].discard(node_id)
+                if not self._replication_in_progress[original_name]:
+                    del self._replication_in_progress[original_name]
+            # Además, si el caller pasó el encrypted key as in-progress, limpiarlo también
+            if file_name in self._replication_in_progress and file_name != original_name:
+                self._replication_in_progress[file_name].discard(node_id)
+                if not self._replication_in_progress[file_name]:
+                    del self._replication_in_progress[file_name]
+
+        self.logger.info(f"📍 Confirmado: '{original_name}' almacenado en {node_id}")
+        
+        # Intentar limpiar entradas encriptadas que puedan duplicar este registro
+        try:
+            self._cleanup_encrypted_entries()
+        except Exception:
+            pass
+
+        return {
+            'status': 'success',
+            'message': f'File location registered: {original_name} -> {node_id}'
+        }
+    
+    def _handle_get_nodes(self, request: dict) -> dict:
+        """Devuelve lista de nodos de procesamiento activos"""
+        nodes = self.registry.get_active_nodes(max_age_seconds=self.NODE_TIMEOUT)
+        
+        return {
+            'status': 'success',
+            'nodes': [n.to_dict() for n in nodes],
+            'count': len(nodes)
+        }
+
+    def _handle_get_coordinators(self, request: dict) -> dict:
+        """
+        Devuelve lista de coordinadores conocidos en el cluster.
+        Usado para descubrimiento dinámico por parte de clientes.
+        """
+        peers = []
+        
+        # Agregar este mismo coordinador
+        peers.append({
+            'coordinator_id': self.coordinator_id,
+            'host': self.announce_host,
+            'port': self.port,
+            'is_leader': self.cluster.is_leader(),
+            'role': self.cluster.role.value if hasattr(self.cluster, 'role') else 'UNKNOWN'
+        })
+        
+        # Agregar peers conocidos
+        if hasattr(self.cluster, 'peers'):
+            for peer_id, peer in self.cluster.peers.items():
+                peers.append({
+                    'coordinator_id': peer.coordinator_id,
+                    'host': peer.host,
+                    'port': peer.port,
+                    'is_leader': False, # Solo estimación
+                    'role': peer.role.value if hasattr(peer, 'role') else 'UNKNOWN'
+                })
+        
+        return {
+            'status': 'success',
+            'coordinators': peers,
+            'count': len(peers)
+        }
+    
+    def _handle_get_file_locations(self, request: dict) -> dict:
+        """Devuelve los nodos donde está almacenado un archivo"""
+        file_name = request.get('file_name')
+        
+        if not file_name:
+            return {'status': 'error', 'message': 'Missing file_name'}
+        
+        # Intentar obtener ubicaciones directas
+        node_ids = self.registry.get_file_locations(file_name)
+        
+        # Si no hay resultados, quizás el cliente envió el nombre encriptado: mapearlo
+        if not node_ids:
+            mapped = self._map_encrypted_to_original(file_name)
+            if mapped:
+                node_ids = self.registry.get_file_locations(mapped) or []
+                file_name = mapped  # devolver el nombre original en la respuesta
+        
+        nodes = []
+        for node_id in node_ids:
+            addr = self.registry.resolve(node_id)
+            if addr:
+                nodes.append({
+                    'node_id': node_id,
+                    'host': addr[0],
+                    'port': addr[1]
+                })
+        
+        return {
+            'status': 'success',
+            'file_name': file_name,
+            'nodes': nodes,
+            'count': len(nodes)
+        }
+    
+    def _handle_list(self, request: dict) -> dict:
+        """
+        Lista todos los archivos indexados en el sistema.
+        Compatible con la interfaz del cliente GUI.
+        """
+        try:
+            # Limpiar posibles entradas encriptadas antes de listar para evitar duplicados
+            try:
+                self._cleanup_encrypted_entries()
+            except Exception:
+                pass
+
+            # Obtener todos los archivos del registro (normalizados)
+            all_files = self.registry.get_all_files()
+            
+            files = []
+            for file_name, node_ids in all_files.items():
+                files.append({
+                    'name': file_name,
+                    'replicas': len(node_ids),
+                    'nodes': list(node_ids)
+                })
+            
+            return {
+                'status': 'success',
+                'files': files,
+                'count': len(files)
+            }
+        except Exception as e:
+            self.logger.error(f"Error en list: {e}")
+            return {'status': 'error', 'message': str(e)}
+    
+    def _handle_download(self, request: dict) -> dict:
+        """
+        Descarga un archivo del sistema distribuido.
+
+        Coordina petición usando nombres cifrados y descifra contenido recibido.
+        """
+        import base64
+        
+        file_id = request.get('file_id') or request.get('file_name')
+        
+        if not file_id:
+            return {'status': 'error', 'message': 'Missing file_id'}
+        
+        # Obtener nodos que tienen el archivo (registro usa el nombre original)
+        node_ids = self.registry.get_file_locations(file_id)
+        
+        if not node_ids:
+            return {'status': 'error', 'message': f'File not found: {file_id}'}
+        
+        # Nombre cifrado determinístico que el nodo debe tener
+        encrypted_name = self._encrypt_filename(file_id)
+        
+        # Intentar descargar de cada nodo hasta tener éxito
+        for node_id in node_ids:
+            addr = self.registry.resolve(node_id)
+            if not addr:
+                continue
+            
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                    sock.settimeout(10)
+                    sock.connect((addr[0], addr[1]))
+                    
+                    # Pedir al nodo de procesamiento el archivo usando el nombre cifrado
+                    download_request = {
+                        'action': 'get_file',
+                        'file_name': encrypted_name,
+                        'encrypted_by_coord': True
+                    }
+                    
+                    self._send_to_socket(sock, download_request)
+                    response = self._receive_from_socket(sock)
+                    
+                    if response and response.get('status') == 'success':
+                        enc_content = response.get('file_content')
+                        if not enc_content:
+                            continue
+                        # Descifrar usando la clave maestra (mismo esquema usado al almacenar)
+                        decrypted = self._decrypt_bytes(enc_content)
+                        if decrypted is None:
+                            # si no pudo descifrar, seguir intentando con otros nodos
+                            continue
+                        b64content = base64.b64encode(decrypted).decode()
+                        return {
+                            'status': 'success',
+                            'file_name': file_id,
+                            'file_content': b64content,
+                            'file_size': len(decrypted)
+                        }
+                        
+            except Exception as e:
+                self.logger.debug(f"Error descargando de {node_id}: {e}")
+                continue
+        
+        return {'status': 'error', 'message': f'Could not download file from any node: {file_id}'}
+
+    def _handle_get_peers(self, request: dict, address: tuple) -> dict:
+        """Para compatibilidad con el sistema de discovery"""
+        # Registrar el nodo que pregunta si es un processing node
+        from_node = request.get('from_node')
+        from_host = request.get('from_host')
+        from_port = request.get('from_port', 5001)
+        from_type = request.get('from_type', 'processing')
+        
+        if from_node and from_host and from_type == 'processing':
+            self.registry.register_node(from_node, from_host, from_port)
+        
+        # Devolver lista de nodos conocidos
+        nodes = self.registry.get_all_nodes()
+        
+        return {
+            'status': 'success',
+            'node_id': self.coordinator_id,
+            'node_type': 'coordinator',
+            'peers': [n.to_dict() for n in nodes]
+        }
+    
+    def _heartbeat_loop(self):
+        """Verifica periódicamente la salud de los nodos de procesamiento"""
+        while self.active:
+            time.sleep(self.HEARTBEAT_INTERVAL)
+            
+            # Solo el líder gestiona la salud activa de los nodos
+            if not self.cluster.is_leader():
+                continue
+
+            nodes = self.registry.get_all_nodes()
+            current_time = time.time()
+            dead_nodes = []
+            
+            for node in nodes:
+                # Verificar si el nodo ha expirado
+                if (current_time - node.last_seen) > self.NODE_TIMEOUT:
+                    # Verificar con un health check directo
+                    if not self._check_node_health(node):
+                        dead_nodes.append(node)
+            
+            # Procesar nodos caídos
+            for node in dead_nodes:
+                self._handle_node_failure(node)
+    
+    def _handle_node_failure(self, node: NodeInfo):
+        """
+        Maneja la caída de un nodo de procesamiento.
+        
+        1. Elimina el nodo del registro
+        2. Identifica archivos que quedaron bajo el factor de replicación
+        3. Dispara re-replicación URGENTE de esos archivos
+        """
+        node_id = node.node_id
+        self.logger.warning(f"💀 Nodo de procesamiento perdido: {node_id}")
+        
+        # Obtener archivos que estaban en este nodo ANTES de eliminarlo
+        affected_files = list(node.files) if node.files else []
+        
+        # Eliminar nodo del registro
+        self.registry.unregister_node(node_id)
+        self.dns.unregister_node(node_id)
+        
+        # Verificar qué archivos necesitan re-replicación urgente
+        urgent_files = []
+        for file_name in affected_files:
+            current_locations = self.registry.get_file_locations(file_name)
+            if len(current_locations) < self.REPLICATION_FACTOR:
+                urgent_files.append((file_name, len(current_locations)))
+        
+        if urgent_files:
+            self.logger.warning(
+                f"⚠️ {len(urgent_files)} archivos necesitan re-replicación URGENTE"
+            )
+            # Disparar re-replicación en paralelo
+            self._urgent_replication(urgent_files)
+    
+    def _urgent_replication(self, files_to_replicate: List[tuple]):
+        """
+        Re-replica archivos de forma urgente después de la caída de un nodo.
+        
+        Args:
+            files_to_replicate: Lista de (file_name, current_replica_count)
+        """
+        threads = []
+        
+        for file_name, current_count in files_to_replicate:
+            t = threading.Thread(
+                target=self._request_replication,
+                args=(file_name, current_count),
+                daemon=True
+            )
+            t.start()
+            threads.append(t)
+        
+        # Esperar que termine la re-replicación (con timeout)
+        for t in threads:
+            t.join(timeout=30)
+        
+        self.logger.info(f"✅ Re-replicación urgente completada para {len(files_to_replicate)} archivos")
+    
+    def _replication_check_loop(self):
+        """Verifica periódicamente que los archivos tengan suficientes réplicas"""
+        while self.active:
+            time.sleep(5)  # Cada 5 segundos (más rápido para pruebas)
+            
+            # Solo el líder gestiona la replicación
+            if not self.cluster.is_leader():
+                continue
+
+            files_needing_replication = self.registry.get_files_needing_replication()
+            
+            if files_needing_replication:
+                self.logger.info(f"🔄 {len(files_needing_replication)} archivos necesitan más réplicas")
+                
+                for file_name, current_replicas in files_needing_replication:
+                    self._request_replication(file_name, current_replicas)
+    
+    def _request_replication(self, file_name: str, current_replicas: int):
+        """Solicita replicación adicional de un archivo"""
+        # Obtener nodos donde ya está el archivo
+        current_nodes = self.registry.get_file_locations(file_name)
+        if not current_nodes:
+            return
+        
+        # Obtener nodos candidatos para replicar
+        needed = self.REPLICATION_FACTOR - current_replicas
+        all_nodes = self.registry.get_active_nodes(max_age_seconds=self.NODE_TIMEOUT)
+        
+        candidates = [n for n in all_nodes if n.node_id not in current_nodes]
+        candidates.sort(key=lambda n: n.load)  # Menos cargados primero
+        
+        if not candidates:
+            return
+        
+        # Seleccionar nodo fuente y destinos
+        source_node_id = current_nodes[0]
+        source = self.registry.lookup(source_node_id)
+        
+        if not source:
+            return
+        
+        for target in candidates[:needed]:
+            self._trigger_replication(file_name, source, target)
+    
     def _trigger_replication(self, file_name: str, source: NodeInfo, target: NodeInfo):
-        """Solicita a un nodo que replique un archivo a otro nodo (envío cifrado)."""
+        """Solicita a un nodo que replique un archivo a otro nodo"""
         # Verificar si ya está en progreso
         with self._replication_lock:
             if file_name not in self._replication_in_progress:
@@ -1181,29 +1629,55 @@ class CoordinatorNode:
             self._replication_in_progress[file_name].add(target.node_id)
         
         try:
-            request = {
-                'action': 'replicate_to',
-                'file_name': file_name,
-                'target_host': target.host,
-                'target_port': target.port,
-                'target_node_id': target.node_id
-            }
-            # Usar helper que encripta antes de enviar y desencripta la respuesta
-            response = self._send_socket_request(source.host, source.port, request, source.node_id, timeout=30)
-
-            self.logger.info(f"📤 Solicitada replicación de '{file_name}': {source.node_id} -> {target.node_id}")
-            self.stats['replications_requested'] += 1
-
-            if response and response.get('status') == 'success':
-                self.logger.info(f"✅ Replicación exitosa de '{file_name}' a {target.node_id}")
-                self.stats['replications_succeeded'] += 1
-                # La confirmación final vendrá cuando el target notifique con file_stored
-            else:
-                self.logger.error(f"❌ Replicación fallida de '{file_name}' a {target.node_id}: {response}")
-                self.stats['replications_failed'] += 1
-                # Remover de en progreso para permitir reintento
-                with self._replication_lock:
-                    self._replication_in_progress[file_name].discard(target.node_id)
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(30)  # Aumentar timeout para archivos grandes
+                sock.connect((source.host, source.port))
+                
+                # Usar nombre cifrado determinístico para que el nodo fuente encuentre el fichero
+                encrypted_name = self._encrypt_filename(file_name)
+                
+                request = {
+                    'action': 'replicate_to',
+                    'file_name': encrypted_name,
+                    'target_host': target.host,
+                    'target_port': target.port,
+                    'target_node_id': target.node_id,
+                    # opcional: indicar original para trazabilidad
+                    'original_file_name': file_name,
+                    'encrypted_by_coord': True
+                }
+                
+                req_json = json.dumps(request)
+                sock.sendall(f"{len(req_json):<8}".encode())
+                sock.sendall(req_json.encode())
+                
+                self.logger.info(f"📤 Solicitada replicación de '{file_name}': {source.node_id} -> {target.node_id}")
+                self.stats['replications_requested'] += 1
+                
+                # Esperar respuesta
+                length_data = sock.recv(8)
+                if length_data:
+                    msg_len = int(length_data.decode().strip())
+                    data = sock.recv(msg_len)
+                    response = json.loads(data.decode())
+                    
+                    if response.get('status') == 'success':
+                        self.logger.info(f"✅ Replicación exitosa de '{file_name}' a {target.node_id}")
+                        self.stats['replications_succeeded'] += 1
+                        # La confirmación final vendrá cuando el target notifique con file_stored
+                    else:
+                        error_msg = response.get('message', 'Unknown error')
+                        self.logger.error(f"❌ Replicación fallida de '{file_name}' a {target.node_id}: {error_msg}")
+                        self.stats['replications_failed'] += 1
+                        # Remover de en progreso para permitir reintento
+                        with self._replication_lock:
+                            self._replication_in_progress[file_name].discard(target.node_id)
+                else:
+                    self.logger.warning(f"⚠️ Sin respuesta de {source.node_id} para replicación de '{file_name}'")
+                    self.stats['replications_failed'] += 1
+                    with self._replication_lock:
+                        self._replication_in_progress[file_name].discard(target.node_id)
+                
         except Exception as e:
             self.logger.error(f"❌ Error solicitando replicación de '{file_name}' ({source.node_id} -> {target.node_id}): {e}")
             self.stats['replications_failed'] += 1
@@ -1211,14 +1685,25 @@ class CoordinatorNode:
             with self._replication_lock:
                 if file_name in self._replication_in_progress:
                     self._replication_in_progress[file_name].discard(target.node_id)
-
+    
     def _check_node_health(self, node: NodeInfo) -> bool:
-        """Verifica si un nodo está vivo con un health check TCP (soporta respuesta cifrada)."""
-        request = {'action': 'health'}
-        response = self._send_socket_request(node.host, node.port, request, node.node_id, timeout=3)
-        if response and response.get('status') == 'ok':
-            self.registry.update_last_seen(node.node_id)
-            return True
+        """Verifica si un nodo está vivo con un health check TCP"""
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(3)
+                sock.connect((node.host, node.port))
+                
+                request = {'action': 'health'}
+                req_json = json.dumps(request)
+                sock.sendall(f"{len(req_json):<8}".encode())
+                sock.sendall(req_json.encode())
+                
+                length_data = sock.recv(8)
+                if length_data:
+                    self.registry.update_last_seen(node.node_id)
+                    return True
+        except:
+            pass
         return False
     
     def _get_cluster_status(self) -> dict:
@@ -1283,7 +1768,7 @@ class CoordinatorNode:
         node = self.registry.lookup(node_id)
         if node and node.current_tasks > 0:
             self.registry.update_node_tasks(node_id, node.current_tasks - 1)
-    
+
     # -----------------------
     # CRYPTO HELPERS
     # -----------------------
@@ -1350,100 +1835,120 @@ class CoordinatorNode:
             self.logger.debug(f"🔓 Error desencriptando payload (maybe not encrypted): {e}")
             return None
 
-    def _send_socket_request(self, host: str, port: int, request: dict, node_id: Optional[str] = None, timeout: int = 10) -> Optional[dict]:
+    # -----------------------
+    # NUEVOS HELPERS DE CRYPTO (BYTES Y NOMBRE DETERMINÍSTICO)
+    # -----------------------
+    def _encrypt_bytes(self, data: bytes) -> str:
         """
-        Envía un request JSON a (host,port) con envoltura de cifrado y recibe respuesta,
-        desencriptando si aplica. Retorna dict o None.
+        Cifra bytes con la clave maestra (misma salida para todos los nodos si se usa Fernet con key derivada sin node_id).
+        Devuelve una cadena segura (base64/urlsafe) que puede almacenarse/transmitirse.
         """
         try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                sock.settimeout(timeout)
-                sock.connect((host, port))
-
-                # Encriptar request
-                try:
-                    encrypted = self._encrypt_payload(request, node_id)
-                    wrapper = {'encrypted': True, 'payload': encrypted}
-                except Exception as e:
-                    self.logger.debug(f"Error encrypting payload, sending plaintext: {e}")
-                    wrapper = request
-
-                # Enviar usando el mismo esquema de longitud
-                self._send_to_socket(sock, wrapper)
-
-                # Recibir respuesta
-                resp = self._receive_from_socket(sock)
-                if not isinstance(resp, dict):
-                    return None
-
-                # Si la respuesta está cifrada, desencriptar
-                if resp.get('encrypted') and 'payload' in resp:
-                    decrypted = self._decrypt_payload(resp['payload'], node_id)
-                    if decrypted is not None:
-                        return decrypted
-                    else:
-                        # Si no se pudo desencriptar, retornar el wrapper original para diagnóstico
-                        return resp
-                else:
-                    return resp
-
+            if self._use_fernet:
+                # derivar con node_id=None => clave global
+                key = self._derive_key(None)
+                f = Fernet(key)
+                token = f.encrypt(data)  # bytes
+                return token.decode()
+            else:
+                key_stream = hashlib.sha256(self._master_key).digest()
+                xored = bytes([b ^ key_stream[i % len(key_stream)] for i, b in enumerate(data)])
+                return base64.b64encode(xored).decode()
         except Exception as e:
-            self.logger.debug(f"Error sending socket request to {host}:{port} - {e}")
+            self.logger.debug(f"Error encrypting bytes: {e}")
             return None
-   
-    def _heartbeat_loop(self):
+
+    def _decrypt_bytes(self, token: str) -> Optional[bytes]:
+        """Descifra la cadena generada por _encrypt_bytes y devuelve bytes o None."""
+        try:
+            if self._use_fernet:
+                key = self._derive_key(None)
+                f = Fernet(key)
+                plain = f.decrypt(token.encode())
+                return plain
+            else:
+                xored = base64.b64decode(token.encode())
+                key_stream = hashlib.sha256(self._master_key).digest()
+                plain = bytes([b ^ key_stream[i % len(key_stream)] for i, b in enumerate(xored)])
+                return plain
+        except Exception as e:
+            self.logger.debug(f"Error decrypting bytes: {e}")
+            return None
+
+    def _encrypt_filename(self, file_name: str) -> str:
         """
-        Loop que monitorea nodos de procesamiento activos.
-        Detecta nuevos nodos y nodos caídos comparando con el conjunto previo.
-        No elimina nada por sí mismo a menos que el registry exponga un método compatible.
+        Convierte un nombre de archivo en una representación cifrada/determinística
+        (HMAC-SHA256 + urlsafe base64). No es necesario revertirla en el nodo,
+        el coordinador volverá a calcularla para búsquedas/descargas.
         """
-        prev_active: Set[str] = set()
-        interval = max(1, self.HEARTBEAT_INTERVAL)
-        while self.active:
-            try:
-                time.sleep(interval)
-                # Obtener nodos activos según el registry (que ya soporta max_age_seconds)
+        try:
+            hm = hmac.new(self._master_key, file_name.encode(), hashlib.sha256).digest()
+            return base64.urlsafe_b64encode(hm).decode().rstrip('=')
+        except Exception as e:
+            self.logger.debug(f"Error encrypting filename: {e}")
+            # Fallback simple
+            return base64.urlsafe_b64encode(file_name.encode()).decode().rstrip('=')
+    
+    def _map_encrypted_to_original(self, encrypted_name: str) -> Optional[str]:
+        """
+        Dado un nombre cifrado (determinístico) intenta encontrar el nombre
+        original en nuestro registro comparando _encrypt_filename(original) == encrypted_name.
+        Retorna el nombre original o None si no se encuentra.
+        """
+        try:
+            all_files = self.registry.get_all_file_names()
+            for orig in all_files:
                 try:
-                    active_nodes = self.registry.get_active_nodes(max_age_seconds=self.NODE_TIMEOUT)
-                    active_ids = set([n.node_id for n in active_nodes])
+                    if self._encrypt_filename(orig) == encrypted_name:
+                        return orig
                 except Exception:
-                    # Como fallback, intentar obtener todos los nodos y filtrar por last_seen si existe
-                    active_ids = set()
-                    all_nodes = []
+                    continue
+        except Exception:
+            pass
+        return None
+
+    def _cleanup_encrypted_entries(self):
+        """
+        Fusiona en el registry las keys que son nombres "encriptados" y que
+        correspondan a un nombre original conocido. Mueve las ubicaciones de
+        nodos desde la key encriptada al nombre original y elimina la entrada
+        encriptada para evitar duplicados visibles al usuario.
+        """
+        try:
+            # Construir conjunto de nombres actuales (posibles originales)
+            originals = set(self.registry.get_all_file_names())
+            # Mapear encrypted_name -> original
+            enc_to_orig = {}
+            for orig in originals:
+                try:
+                    enc = self._encrypt_filename(orig)
+                    enc_to_orig[enc] = orig
+                except Exception:
+                    continue
+
+            # Revisar las keys actuales en file_locations
+            keys = list(self.registry.file_locations.keys())
+            for key in keys:
+                # Si la key es una representación encriptada que corresponde a un original
+                if key in enc_to_orig:
+                    orig = enc_to_orig[key]
+                    # Mover nodos de 'key' a 'orig'
+                    node_set = set(self.registry.file_locations.get(key, []))
+                    if node_set:
+                        for node_id in node_set:
+                            # Registrar ubicación bajo el nombre original (idempotente)
+                            self.registry.register_file_location(orig, node_id)
+                            # Además eliminar el nombre encriptado de la lista de archivos del nodo si existe
+                            node_obj = self.registry.lookup(node_id)
+                            if node_obj and key in getattr(node_obj, 'files', set()):
+                                try:
+                                    node_obj.files.discard(key)
+                                except Exception:
+                                    pass
+                    # Finalmente eliminar la entrada encriptada del registry interno
                     try:
-                        all_nodes = self.registry.get_all_nodes()
+                        del self.registry.file_locations[key]
                     except Exception:
-                        all_nodes = []
-                    now = time.time()
-                    for n in all_nodes:
-                        last = getattr(n, 'last_seen', None)
-                        if last is None:
-                            # Si no hay last_seen, asumir activo
-                            active_ids.add(n.node_id)
-                        else:
-                            if (now - last) <= self.NODE_TIMEOUT:
-                                active_ids.add(n.node_id)
-
-                # Detectar cambios
-                lost = prev_active - active_ids
-                new = active_ids - prev_active
-
-                for nid in new:
-                    self.logger.info(f"💚 Nodo activo detectado: {nid}")
-
-                for nid in lost:
-                    self.logger.warning(f"❌ Nodo no responde / timed out: {nid}")
-                    # Intentar llamar a un método de registry para marcar/remover nodo si existe
-                    try:
-                        if hasattr(self.registry, 'mark_node_offline'):
-                            self.registry.mark_node_offline(nid)
-                        elif hasattr(self.registry, 'remove_node'):
-                            self.registry.remove_node(nid)
-                    except Exception:
-                        # No es crítico; sólo loguear
-                        self.logger.debug(f"No se pudo marcar/remover nodo {nid} en registry")
-
-                prev_active = active_ids
-
-            except Exception as e:
-                self.logger.debug(f"Error en heartbeat loop: {e}")
+                        pass
+        except Exception as e:
+            self.logger.debug(f"Error cleaning encrypted entries: {e}")
