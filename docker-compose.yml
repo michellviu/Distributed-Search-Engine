@@ -32,7 +32,7 @@ services:
           - node.hostname == michell
       restart_policy:
         condition: on-failure
-        delay: 120s
+        delay: 12000s
 
   # ---------------------------------------------------------------------------
   # COORDINADOR 2 (Host: eveliz) -> Port 5001
@@ -64,7 +64,7 @@ services:
           - node.hostname == eveliz
       restart_policy:
         condition: on-failure
-        delay: 120s
+        delay: 12000s
 
   # ---------------------------------------------------------------------------
   # NODO PROCESAMIENTO 1 (Host: michell)
@@ -98,7 +98,7 @@ services:
           - node.hostname == michell
       restart_policy:
         condition: on-failure
-        delay: 120s
+        delay: 12000s
   # ---------------------------------------------------------------------------
   # NODO PROCESAMIENTO 2 (Host: eveliz)
   # ---------------------------------------------------------------------------
@@ -131,7 +131,7 @@ services:
           - node.hostname == eveliz
       restart_policy:
         condition: on-failure
-        delay: 120s
+        delay: 12000s
 
 networks:
   search-network:
