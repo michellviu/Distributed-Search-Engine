@@ -1777,11 +1777,12 @@ class CoordinatorNode:
         Inicializa claves para cifrado. Usa una clave maestra (env COORD_MASTER_KEY)
         o genera una si no está presente. Soporta Fernet si está instalado,
         sino usa un fallback XOR simple.
+        Además imprime la clave maestra (en base64 urlsafe) para depuración.
         """
         env_key = os.environ.get('COORD_MASTER_KEY')
         if env_key:
             try:
-                # Esperar base64 urlsafe encoded para Fernet, si viene así
+                # Mantener compatibilidad con la implementación previa
                 self._master_key = env_key.encode()
             except Exception:
                 self._master_key = env_key.encode()
@@ -1795,6 +1796,19 @@ class CoordinatorNode:
             self.logger.debug("🔐 Fernet disponible: usando cifrado fuerte")
         else:
             self.logger.warning("⚠️ cryptography no disponible: usando fallback XOR (no seguro)")
+
+        # Imprimir/registrar la clave maestra en base64 urlsafe para facilitar debugging
+        try:
+            display_key = base64.urlsafe_b64encode(self._master_key).decode().rstrip('=')
+        except Exception:
+            try:
+                display_key = self._master_key.decode()
+            except Exception:
+                display_key = repr(self._master_key)
+
+        # También imprimir en stdout por petición explícita
+        print(f"COORD_MASTER_KEY (base64 urlsafe): {display_key}")
+        self.logger.info(f"COORD_MASTER_KEY (base64 urlsafe): {display_key}")
 
     def _derive_key(self, node_id: Optional[str]) -> bytes:
         """
