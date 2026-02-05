@@ -126,6 +126,7 @@ class DistributedClient:
     MAX_RETRIES = 3
     RETRY_DELAY = 1.0
     HEALTH_CHECK_INTERVAL = 10
+    LEADER_CHECK_INTERVAL = 5  # Verificar líder cada 5 segundos
     MAX_FAILURES_BEFORE_SKIP = 3
     DISCOVERED_COORDINATORS_FILE = "discovered_coordinators.json"
     
@@ -289,8 +290,16 @@ class DistributedClient:
             return False
     
     def _ask_for_leader(self, coord: CoordinatorInfo) -> Optional[CoordinatorInfo]:
-        """Pregunta a un coordinador quién es el líder actual"""
+        """Pregunta a un coordinador quién es el líder actual.
+        
+        Usa el endpoint 'health' para saber si coord es el líder,
+        y luego 'get_coordinators' para obtener la dirección real del líder.
+        
+        Returns:
+            CoordinatorInfo del líder actual, o None si no se puede determinar.
+        """
         try:
+            # Paso 1: Preguntar health para saber si este coord es el líder
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.settimeout(5)
                 sock.connect((coord.host, coord.port))
@@ -300,14 +309,63 @@ class DistributedClient:
                 response = self._receive_response(sock)
                 
                 if response and response.get('status') == 'ok':
+                    is_leader = response.get('is_leader', False)
+                    coord.is_leader = is_leader
+                    
+                    if is_leader:
+                        return coord
+                    
+                    # Este coord no es líder, preguntar por la lista de coordinadores
+                    # para encontrar al líder real
                     leader_id = response.get('current_leader')
-                    if leader_id and not coord.is_leader:
-                        # Buscar el líder en nuestra lista
-                        for c in self.coordinators:
-                            if c.is_leader:
-                                return c
-        except:
-            pass
+                    if leader_id:
+                        return self._resolve_leader_from_cluster(coord, leader_id)
+        except Exception as e:
+            self.logger.debug(f"Error preguntando líder a {coord.address}: {e}")
+        return None
+    
+    def _resolve_leader_from_cluster(self, coord: CoordinatorInfo, leader_id: str) -> Optional[CoordinatorInfo]:
+        """Consulta get_coordinators para resolver la dirección del líder por su ID."""
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(5)
+                sock.connect((coord.host, coord.port))
+                
+                request = {'action': 'get_coordinators'}
+                self._send_request(sock, request)
+                response = self._receive_response(sock)
+                
+                if response and response.get('status') == 'success':
+                    for c_info in response.get('coordinators', []):
+                        c_id = c_info.get('coordinator_id', '')
+                        c_host = c_info.get('host')
+                        c_port = c_info.get('port', 5000)
+                        c_is_leader = c_info.get('is_leader', False)
+                        
+                        if not c_host:
+                            continue
+                        
+                        # Actualizar o agregar coordinador
+                        self._merge_coordinators([c_info])
+                        
+                        # Si es el líder, devolver su info
+                        if c_id == leader_id or c_is_leader:
+                            # Buscar en nuestra lista actualizada
+                            address = f"{c_host}:{c_port}"
+                            for existing in self.coordinators:
+                                if existing.address == address:
+                                    existing.is_leader = True
+                                    return existing
+                            
+                            # Si no existía, crear nuevo
+                            new_leader = CoordinatorInfo(
+                                host=c_host, port=c_port, is_leader=True
+                            )
+                            self.coordinators.append(new_leader)
+                            self._save_coordinators()
+                            return new_leader
+        except Exception as e:
+            self.logger.debug(f"Error resolviendo líder desde {coord.address}: {e}")
         return None
     
     def _check_coordinator_health(self, coord: CoordinatorInfo) -> bool:
@@ -339,28 +397,74 @@ class DistributedClient:
         return False
     
     def _health_check_loop(self):
-        """Verifica periódicamente la salud de los coordinadores y descubre nuevos"""
+        """Verifica periódicamente la salud de los coordinadores y descubre nuevos.
+        
+        Cada LEADER_CHECK_INTERVAL segundos verifica si el líder cambió.
+        Cada HEALTH_CHECK_INTERVAL segundos hace health check completo de todos.
+        """
+        last_full_check = 0
+        
         while self._active:
-            time.sleep(self.HEALTH_CHECK_INTERVAL)
+            time.sleep(self.LEADER_CHECK_INTERVAL)
             
-            # Descubrir nuevos coordinadores del cluster
-            self._discover_coordinators_from_cluster()
+            # === Verificación de líder (frecuente) ===
+            self._verify_and_switch_leader()
             
-            # Verificar salud y re-encontrar líder si es necesario
-            if self.current_coordinator:
-                if not self._check_coordinator_health(self.current_coordinator):
-                    self._find_active_coordinator()
-                else:
-                    # Preguntar al coordinador actual quién es el líder
-                    leader = self._ask_for_leader(self.current_coordinator)
-                    if leader and leader != self.current_coordinator:
-                        if self._check_coordinator_health(leader):
-                            self.logger.info(f"🔄 Cambiando a nuevo líder: {leader.address}")
-                            self.current_coordinator = leader
-            
-            for coord in self.coordinators:
-                if coord != self.current_coordinator:
-                    self._check_coordinator_health(coord)
+            # === Health check completo (menos frecuente) ===
+            elapsed = time.time() - last_full_check
+            if elapsed >= self.HEALTH_CHECK_INTERVAL:
+                last_full_check = time.time()
+                
+                # Descubrir nuevos coordinadores del cluster
+                self._discover_coordinators_from_cluster()
+                
+                # Verificar salud de todos los coordinadores
+                for coord in self.coordinators:
+                    if coord != self.current_coordinator:
+                        self._check_coordinator_health(coord)
+    
+    def _verify_and_switch_leader(self):
+        """Verifica si el coordinador actual sigue siendo el líder y cambia si es necesario.
+        
+        Se ejecuta frecuentemente para garantizar que siempre estemos conectados al líder.
+        """
+        if not self.current_coordinator:
+            self._find_active_coordinator()
+            return
+        
+        # 1. Verificar que el coordinador actual esté vivo
+        if not self._check_coordinator_health(self.current_coordinator):
+            self.logger.warning(f"⚠️ Coordinador actual caído: {self.current_coordinator.address}")
+            self.current_coordinator = None
+            self._find_active_coordinator()
+            return
+        
+        # 2. Si el coordinador actual ya no es líder, buscar el nuevo líder
+        if not self.current_coordinator.is_leader:
+            self.logger.info(f"🔄 Coordinador actual {self.current_coordinator.address} ya no es líder, buscando nuevo líder...")
+            leader = self._ask_for_leader(self.current_coordinator)
+            if leader and leader != self.current_coordinator:
+                if self._check_coordinator_health(leader):
+                    old_addr = self.current_coordinator.address
+                    self.current_coordinator = leader
+                    self.logger.info(f"✅ Cambiado de {old_addr} al nuevo LÍDER: {leader.address}")
+                    return
+            # Si no se encontró líder por ask, buscar en toda la lista
+            self._find_active_coordinator()
+            return
+        
+        # 3. Incluso si creemos que es líder, confirmar periódicamente
+        #    preguntando a otro coordinador para detectar split-brain
+        for coord in self.coordinators:
+            if coord != self.current_coordinator and coord.is_alive and coord.failures < self.MAX_FAILURES_BEFORE_SKIP:
+                leader = self._ask_for_leader(coord)
+                if leader and leader != self.current_coordinator and leader.is_leader:
+                    # Otro coordinador reporta un líder diferente
+                    if self._check_coordinator_health(leader):
+                        old_addr = self.current_coordinator.address
+                        self.current_coordinator = leader
+                        self.logger.info(f"🔄 Líder cambió: {old_addr} → {leader.address}")
+                break  # Solo necesitamos consultar a uno
     
     def _discover_coordinators_from_cluster(self):
         """Pregunta a cualquier coordinador conocido por la lista actualizada de peers"""
@@ -447,7 +551,11 @@ class DistributedClient:
             return None
     
     def _execute_with_failover(self, request: dict) -> Optional[dict]:
-        """Ejecuta una request con soporte de failover"""
+        """Ejecuta una request con soporte de failover y redirección al líder.
+        
+        Si un coordinador responde con 'redirect', el cliente se reconecta
+        automáticamente al líder indicado y reintenta la petición.
+        """
         for attempt in range(self.MAX_RETRIES):
             if not self.current_coordinator:
                 if not self._find_active_coordinator():
@@ -465,17 +573,60 @@ class DistributedClient:
                     response = self._receive_response(sock)
                     
                     if response:
+                        # Manejar redirección al líder
+                        if response.get('status') == 'redirect':
+                            leader_host = response.get('leader_host')
+                            leader_port = response.get('leader_port')
+                            if leader_host and leader_port:
+                                self.logger.info(
+                                    f"↪️ Redirigido al líder: {leader_host}:{leader_port}"
+                                )
+                                # Marcar el actual como no-líder
+                                self.current_coordinator.is_leader = False
+                                # Buscar o crear el coordinador líder
+                                leader = self._get_or_create_coordinator(
+                                    leader_host, int(leader_port)
+                                )
+                                leader.is_leader = True
+                                if self._check_coordinator_health(leader):
+                                    self.current_coordinator = leader
+                                    # Reintentar inmediatamente con el líder
+                                    continue
+                                else:
+                                    self.current_coordinator = None
+                                    continue
+                            else:
+                                # Redirect sin dirección, buscar líder
+                                self.current_coordinator.is_leader = False
+                                self.current_coordinator = None
+                                continue
+                        
                         return response
                     
             except Exception:
-                self.current_coordinator.failures += 1
-                self.current_coordinator.is_alive = False
+                if self.current_coordinator:
+                    self.current_coordinator.failures += 1
+                    self.current_coordinator.is_alive = False
                 self.current_coordinator = None
                 
                 delay = self.RETRY_DELAY * (2 ** attempt)
                 time.sleep(delay)
         
         return {'status': 'error', 'message': 'Todos los reintentos fallaron'}
+    
+    def _get_or_create_coordinator(self, host: str, port: int) -> CoordinatorInfo:
+        """Busca un coordinador existente por dirección o crea uno nuevo."""
+        address = f"{host}:{port}"
+        with self._lock:
+            for coord in self.coordinators:
+                if coord.address == address:
+                    return coord
+            
+            new_coord = CoordinatorInfo(host=host, port=port)
+            self.coordinators.append(new_coord)
+            self.logger.info(f"🔍 Nuevo coordinador descubierto por redirect: {address}")
+            self._save_coordinators()
+            return new_coord
     
     # ========================================================================
     # API compatible con SearchClient (usado por SearchEngineGUI)

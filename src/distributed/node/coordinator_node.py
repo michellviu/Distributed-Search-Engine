@@ -186,15 +186,18 @@ class CoordinatorNode:
         if self.peer_coordinators:
             self.cluster.start()
             self.logger.info("✅ Cluster de coordinadores iniciado (Bully)")
-            
-            # 5. Iniciar sincronización continua de estado entre coordinadores
-            threading.Thread(target=self._state_sync_loop, daemon=True).start()
-            self.logger.info("✅ Sincronización de estado entre coordinadores iniciada")
         else:
             # Si no hay peers, somos el líder por defecto
+            self.cluster.active = True
             self.cluster.role = CoordinatorRole.LEADER
             self.cluster.current_leader = self.coordinator_id
             self.logger.info("✅ Único coordinador - asumiendo liderazgo")
+        
+        # 5. Iniciar sincronización continua de estado entre coordinadores
+        # Se inicia SIEMPRE, incluso si no hay peers al inicio, para que
+        # cuando se agreguen coordinadores dinámicamente la sincronización funcione.
+        threading.Thread(target=self._state_sync_loop, daemon=True).start()
+        self.logger.info("✅ Sincronización de estado entre coordinadores iniciada")
         
         self.logger.info("🎯 Coordinador listo para recibir conexiones")
         
@@ -744,9 +747,10 @@ class CoordinatorNode:
         self.logger.info(f"🔄 Solicitud de reconciliación de {from_id}")
         
         # Obtener nuestro estado actual
+        # IMPORTANTE: Convertir sets a lists para JSON serialization
         our_state = {
             'nodes': {nid: node.to_dict() for nid, node in self.registry.nodes.items()},
-            'file_locations': dict(self.registry.file_locations)
+            'file_locations': {k: list(v) for k, v in self.registry.file_locations.items()}
         }
         
         # Realizar la reconciliación
@@ -847,6 +851,10 @@ class CoordinatorNode:
         while self.active:
             time.sleep(STATE_SYNC_INTERVAL)
             
+            # Solo sincronizar si hay peers en el cluster
+            if not self.cluster.peers:
+                continue
+            
             try:
                 if self.cluster.is_leader():
                     # Somos el líder: replicar estado a todos los followers
@@ -854,15 +862,17 @@ class CoordinatorNode:
                     # IMPORTANTE: Convertir sets a lists para JSON serialization
                     file_locations = {k: list(v) for k, v in self.registry.file_locations.items()}
                     
+                    alive_peers = sum(1 for p in self.cluster.peers.values() if p.is_alive)
                     if nodes or file_locations:
                         self.cluster.replicate_state(nodes, file_locations)
-                        self.logger.debug(
-                            f"📤 Estado replicado a followers: "
+                        self.logger.info(
+                            f"📤 [SYNC] Estado replicado a {alive_peers} followers: "
                             f"{len(nodes)} nodos, {len(file_locations)} archivos"
                         )
-                else:
-                    # Somos follower: asegurar que el líder tenga nuestros datos (Anti-Entropy)
+                elif self.cluster.current_leader:
+                    # Somos follower con líder conocido: enviar nuestros datos (Anti-Entropy)
                     # Esto cubre el caso "Split Brain" donde recibimos datos aislados
+                    self.logger.debug(f"📥 [SYNC] Solicitando reconciliación con líder {self.cluster.current_leader}")
                     self.request_reconciliation_from_leader()
                     
             except Exception as e:

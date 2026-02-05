@@ -332,6 +332,22 @@ class CoordinatorCluster:
         # Persistir estado
         self._save_state()
     
+    def _send_state_to_peer(self, peer: CoordinatorPeer, snapshot: StateSnapshot):
+        """Envía un snapshot de estado a un peer específico"""
+        try:
+            request = {
+                'action': 'replicate_state',
+                'from_coordinator': self.coordinator_id,
+                'state': snapshot.to_dict()
+            }
+            response = self._send_request_to_peer(peer, request)
+            if response and response.get('status') == 'ok':
+                self.logger.debug(f"📤 Estado replicado a {peer.coordinator_id} (v{snapshot.version})")
+            else:
+                self.logger.debug(f"⚠️ Fallo replicando estado a {peer.coordinator_id}")
+        except Exception as e:
+            self.logger.debug(f"Error replicando estado a {peer.coordinator_id}: {e}")
+    
     def _send_request_to_peer(self, peer: CoordinatorPeer, request: dict) -> Optional[dict]:
         """Envía una request a un peer y retorna la response"""
         try:
@@ -369,7 +385,7 @@ class CoordinatorCluster:
         with self._state_lock:
             snapshot = StateSnapshot.from_dict(state_data)
             
-            if snapshot.version > self.state_version:
+            if snapshot.version >= self.state_version:
                 self.state_version = snapshot.version
                 self.logger.debug(
                     f"📥 Estado recibido de {from_coordinator} (v{snapshot.version})"
