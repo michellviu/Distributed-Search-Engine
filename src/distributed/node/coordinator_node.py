@@ -1774,41 +1774,34 @@ class CoordinatorNode:
     # -----------------------
     def _init_crypto(self):
         """
-        Inicializa claves para cifrado. Usa una clave maestra (env COORD_MASTER_KEY)
-        o genera una si no está presente. Soporta Fernet si está instalado,
-        sino usa un fallback XOR simple.
-        Además imprime la clave maestra (en base64 urlsafe) para depuración.
+        Inicializa la clave maestra SÓLO desde la variable de entorno COORD_MASTER_KEY.
+        Si no está presente, lanza un error para forzar la configuración.
+        Imprime la clave cargada en los logs (según petición).
         """
         env_key = os.environ.get('COORD_MASTER_KEY')
-        if env_key:
-            try:
-                # Mantener compatibilidad con la implementación previa
-                self._master_key = env_key.encode()
-            except Exception:
-                self._master_key = env_key.encode()
-        else:
-            # Generar clave aleatoria de 32 bytes
-            self._master_key = secrets.token_bytes(32)
+        if not env_key:
+            self.logger.error("❌ COORD_MASTER_KEY no encontrada en el entorno. Esta clave es requerida.")
+            raise RuntimeError("COORD_MASTER_KEY environment variable is required")
 
+        # Usar exactamente la clave provista en la variable de entorno (sin generar nuevas)
+        try:
+            self._master_key = env_key.encode()
+        except Exception:
+            self._master_key = str(env_key).encode()
+
+        # Mostrar la clave en logs explícitamente (advertencia: inseguro en producción)
+        try:
+            self.logger.info(f"🔐 COORD_MASTER_KEY cargada: {env_key}")
+        except Exception:
+            # En caso de que logger falle por alguna razón, al menos mantener la ejecución
+            pass
+
+        # Mantener decisión sobre uso de Fernet basada en disponibilidad de cryptography
         self._use_fernet = _HAS_CRYPTO
         if self._use_fernet:
-            # Nada más: derivaremos claves por nodo cuando haga falta
             self.logger.debug("🔐 Fernet disponible: usando cifrado fuerte")
         else:
             self.logger.warning("⚠️ cryptography no disponible: usando fallback XOR (no seguro)")
-
-        # Imprimir/registrar la clave maestra en base64 urlsafe para facilitar debugging
-        try:
-            display_key = base64.urlsafe_b64encode(self._master_key).decode().rstrip('=')
-        except Exception:
-            try:
-                display_key = self._master_key.decode()
-            except Exception:
-                display_key = repr(self._master_key)
-
-        # También imprimir en stdout por petición explícita
-        print(f"COORD_MASTER_KEY (base64 urlsafe): {display_key}")
-        self.logger.info(f"COORD_MASTER_KEY (base64 urlsafe): {display_key}")
 
     def _derive_key(self, node_id: Optional[str]) -> bytes:
         """
