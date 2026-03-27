@@ -75,6 +75,11 @@ class CoordinatorNode:
     NODE_TIMEOUT = 15  # Segundos sin respuesta para considerar nodo muerto
     REPLICATION_FACTOR = 3  # Número de réplicas por archivo
     QUORUM_LEVEL = QuorumLevel.QUORUM  # Nivel de consistencia por defecto
+    CLIENT_REQUEST_TIMEOUT = 300.0
+    NODE_TRANSFER_BASE_TIMEOUT = 60.0
+    NODE_TRANSFER_SECONDS_PER_MB = 2.0
+    MAX_NODE_TRANSFER_TIMEOUT = 1800.0
+    SOCKET_CHUNK_SIZE = 64 * 1024
     
     def __init__(self, 
                  coordinator_id: str,
@@ -245,22 +250,35 @@ class CoordinatorNode:
         json_data = json.dumps(data)
         message = f"{len(json_data):<8}{json_data}"
         sock.sendall(message.encode())
+
+    def _recv_exact(self, sock: socket.socket, length: int, chunk_size: int = None) -> bytes:
+        """Recibe exactamente `length` bytes o menos si el socket se cierra."""
+        if chunk_size is None:
+            chunk_size = self.SOCKET_CHUNK_SIZE
+
+        data = bytearray()
+        while len(data) < length:
+            chunk = sock.recv(min(chunk_size, length - len(data)))
+            if not chunk:
+                break
+            data.extend(chunk)
+
+        return bytes(data)
     
     def _receive_from_socket(self, sock: socket.socket) -> dict:
         """Recibe datos JSON de un socket con prefijo de longitud"""
         try:
-            length_str = sock.recv(8).decode()
-            if not length_str:
+            length_data = self._recv_exact(sock, 8, chunk_size=8)
+            if len(length_data) != 8:
                 return None
+
+            length_str = length_data.decode()
             length = int(length_str.strip())
-            
-            data = b''
-            while len(data) < length:
-                chunk = sock.recv(min(4096, length - len(data)))
-                if not chunk:
-                    break
-                data += chunk
-            
+
+            data = self._recv_exact(sock, length)
+            if len(data) != length:
+                return None
+
             return json.loads(data.decode())
         except Exception as e:
             self.logger.debug(f"Error recibiendo de socket: {e}")
@@ -292,22 +310,23 @@ class CoordinatorNode:
     def _handle_connection(self, client_socket: socket.socket, address: tuple):
         """Maneja una conexión entrante"""
         try:
-            client_socket.settimeout(30)
+            # Permite recibir requests grandes (store con payload base64).
+            client_socket.settimeout(self.CLIENT_REQUEST_TIMEOUT)
             
             # Leer header con longitud
-            length_data = client_socket.recv(8)
-            if not length_data:
+            length_data = self._recv_exact(client_socket, 8, chunk_size=8)
+            if len(length_data) != 8:
                 return
             
             msg_len = int(length_data.decode().strip())
             
             # Leer mensaje
-            data = b''
-            while len(data) < msg_len:
-                chunk = client_socket.recv(min(4096, msg_len - len(data)))
-                if not chunk:
-                    break
-                data += chunk
+            data = self._recv_exact(client_socket, msg_len)
+            if len(data) != msg_len:
+                self.logger.warning(
+                    f"Request incompleto de {address}: esperado {msg_len} bytes, recibido {len(data)}"
+                )
+                return
             
             request = json.loads(data.decode())
             response = self._handle_request(request, address)
@@ -1209,11 +1228,18 @@ class CoordinatorNode:
             # Cifrar el contenido con la clave maestra (mismo ciphertext para todas las réplicas)
             encrypted_content = self._encrypt_bytes(raw_bytes)  # devuelve base64/text
 
+            file_size_mb = max(1.0, len(raw_bytes) / (1024 * 1024))
+            transfer_timeout = self.NODE_TRANSFER_BASE_TIMEOUT + (file_size_mb * self.NODE_TRANSFER_SECONDS_PER_MB)
+            transfer_timeout = min(
+                max(transfer_timeout, self.NODE_TRANSFER_BASE_TIMEOUT),
+                self.MAX_NODE_TRANSFER_TIMEOUT
+            )
+
             # Nombre determinístico (para que el nodo lo use como key para almacenamiento)
             encrypted_name = self._encrypt_filename(file_name)
 
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                sock.settimeout(30)
+                sock.settimeout(transfer_timeout)
                 sock.connect((host, port))
                 
                 request = {

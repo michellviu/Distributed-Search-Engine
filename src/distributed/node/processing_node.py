@@ -45,6 +45,11 @@ class ProcessingNode:
     # Configuración
     HEARTBEAT_INTERVAL = 5  # Segundos entre heartbeats al coordinador
     COORDINATOR_RETRY_INTERVAL = 10  # Segundos entre reintentos de conexión
+    CLIENT_REQUEST_TIMEOUT = 300.0
+    PEER_TRANSFER_BASE_TIMEOUT = 60.0
+    PEER_TRANSFER_SECONDS_PER_MB = 2.0
+    MAX_PEER_TRANSFER_TIMEOUT = 1800.0
+    SOCKET_CHUNK_SIZE = 64 * 1024
     
     def __init__(self,
                  node_id: str,
@@ -283,6 +288,20 @@ class ProcessingNode:
             self.logger.warning(f"⚠️ Error solicitando asignación de archivos: {e}")
         
         return None
+
+    def _recv_exact(self, sock: socket.socket, length: int, chunk_size: int = None) -> bytes:
+        """Recibe exactamente `length` bytes o menos si el socket se cierra."""
+        if chunk_size is None:
+            chunk_size = self.SOCKET_CHUNK_SIZE
+
+        data = bytearray()
+        while len(data) < length:
+            chunk = sock.recv(min(chunk_size, length - len(data)))
+            if not chunk:
+                break
+            data.extend(chunk)
+
+        return bytes(data)
     
     def _start_server(self):
         """Inicia el servidor TCP interno"""
@@ -315,22 +334,23 @@ class ProcessingNode:
     def _handle_connection(self, client_socket: socket.socket, address: tuple):
         """Maneja una conexión entrante"""
         try:
-            client_socket.settimeout(30)
+            # Permite recibir requests grandes (store/replicate con payload base64).
+            client_socket.settimeout(self.CLIENT_REQUEST_TIMEOUT)
             
             # Leer header con longitud
-            length_data = client_socket.recv(8)
-            if not length_data:
+            length_data = self._recv_exact(client_socket, 8, chunk_size=8)
+            if len(length_data) != 8:
                 return
             
             msg_len = int(length_data.decode().strip())
             
             # Leer mensaje
-            data = b''
-            while len(data) < msg_len:
-                chunk = client_socket.recv(min(4096, msg_len - len(data)))
-                if not chunk:
-                    break
-                data += chunk
+            data = self._recv_exact(client_socket, msg_len)
+            if len(data) != msg_len:
+                self.logger.warning(
+                    f"Request incompleto de {address}: esperado {msg_len} bytes, recibido {len(data)}"
+                )
+                return
             
             request = json.loads(data.decode())
             response = self._handle_request(request, address)
@@ -565,10 +585,17 @@ class ProcessingNode:
                 file_content = f.read()
             
             file_content_b64 = base64.b64encode(file_content).decode()
+
+            file_size_mb = max(1.0, len(file_content) / (1024 * 1024))
+            transfer_timeout = self.PEER_TRANSFER_BASE_TIMEOUT + (file_size_mb * self.PEER_TRANSFER_SECONDS_PER_MB)
+            transfer_timeout = min(
+                max(transfer_timeout, self.PEER_TRANSFER_BASE_TIMEOUT),
+                self.MAX_PEER_TRANSFER_TIMEOUT
+            )
             
             # Enviar al nodo destino
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                sock.settimeout(30)
+                sock.settimeout(transfer_timeout)
                 sock.connect((target_host, target_port))
                 
                 replicate_request = {
