@@ -128,6 +128,11 @@ class DistributedClient:
     HEALTH_CHECK_INTERVAL = 10
     LEADER_CHECK_INTERVAL = 5  # Verificar líder cada 5 segundos
     MAX_FAILURES_BEFORE_SKIP = 3
+    CONNECT_TIMEOUT = 5.0
+    DEFAULT_REQUEST_TIMEOUT = 15.0
+    LARGE_TRANSFER_BASE_TIMEOUT = 60.0
+    LARGE_TRANSFER_SECONDS_PER_MB = 2.0
+    MAX_LARGE_TRANSFER_TIMEOUT = 1800.0
     DISCOVERED_COORDINATORS_FILE = "discovered_coordinators.json"
     
     @classmethod
@@ -549,6 +554,26 @@ class DistributedClient:
             return json.loads(data.decode())
         except:
             return None
+
+    def _estimate_request_timeout(self, request: dict) -> float:
+        """Calcula timeout dinámico para operaciones pesadas (store/download)."""
+        action = request.get('action')
+
+        if action in ('store', 'download'):
+            file_size = request.get('file_size')
+
+            if not isinstance(file_size, int) and 'file_content' in request:
+                # Base64: 4 chars representan 3 bytes aprox.
+                file_size = int((len(request.get('file_content', '')) * 3) / 4)
+
+            if not isinstance(file_size, int):
+                file_size = 0
+
+            size_mb = max(1.0, file_size / (1024 * 1024))
+            estimated = self.LARGE_TRANSFER_BASE_TIMEOUT + (size_mb * self.LARGE_TRANSFER_SECONDS_PER_MB)
+            return min(max(estimated, self.DEFAULT_REQUEST_TIMEOUT), self.MAX_LARGE_TRANSFER_TIMEOUT)
+
+        return self.DEFAULT_REQUEST_TIMEOUT
     
     def _execute_with_failover(self, request: dict) -> Optional[dict]:
         """Ejecuta una request con soporte de failover y redirección al líder.
@@ -556,6 +581,8 @@ class DistributedClient:
         Si un coordinador responde con 'redirect', el cliente se reconecta
         automáticamente al líder indicado y reintenta la petición.
         """
+        request_timeout = self._estimate_request_timeout(request)
+
         for attempt in range(self.MAX_RETRIES):
             if not self.current_coordinator:
                 if not self._find_active_coordinator():
@@ -563,11 +590,14 @@ class DistributedClient:
             
             try:
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                    sock.settimeout(10)
+                    sock.settimeout(self.CONNECT_TIMEOUT)
                     sock.connect((
                         self.current_coordinator.host,
                         self.current_coordinator.port
                     ))
+
+                    # Timeout específico por tipo de operación.
+                    sock.settimeout(request_timeout)
                     
                     self._send_request(sock, request)
                     response = self._receive_response(sock)

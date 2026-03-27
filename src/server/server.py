@@ -945,8 +945,19 @@ class SearchServer:
         finally:
             client_socket.close()
             self.logger.info(f"Connection closed: {address}")
+
+    def _receive_exact(self, client_socket: socket.socket, total_size: int, buffer_size: int = 65536) -> bytes:
+        """Receive exactly `total_size` bytes or fewer if the socket closes."""
+        data = bytearray()
+        while len(data) < total_size:
+            chunk = client_socket.recv(min(buffer_size, total_size - len(data)))
+            if not chunk:
+                break
+            data.extend(chunk)
+
+        return bytes(data)
     
-    def _receive_data(self, client_socket: socket.socket, buffer_size: int = 4096) -> str:
+    def _receive_data(self, client_socket: socket.socket, buffer_size: int = 65536) -> str:
         """
         Receive data from client socket
         
@@ -959,19 +970,19 @@ class SearchServer:
         """
         try:
             # First receive the length of the message
-            length_data = client_socket.recv(8)
-            if not length_data:
+            length_data = self._receive_exact(client_socket, 8, buffer_size=8)
+            if len(length_data) != 8:
                 return ''
             
             message_length = int(length_data.decode().strip())
             
             # Receive the actual message
-            data = b''
-            while len(data) < message_length:
-                chunk = client_socket.recv(min(buffer_size, message_length - len(data)))
-                if not chunk:
-                    break
-                data += chunk
+            data = self._receive_exact(client_socket, message_length, buffer_size=buffer_size)
+            if len(data) != message_length:
+                self.logger.warning(
+                    f"Incomplete request payload: expected {message_length} bytes, got {len(data)}"
+                )
+                return ''
             
             return data.decode('utf-8')
         except Exception as e:
@@ -979,7 +990,7 @@ class SearchServer:
             return ''
     
     def _receive_file_content(self, client_socket: socket.socket, file_size: int, 
-                             buffer_size: int = 4096) -> bytes:
+                             buffer_size: int = 65536) -> bytes:
         """
         Receive file content from client socket
         
@@ -993,12 +1004,11 @@ class SearchServer:
         """
         try:
             self.logger.info(f"Receiving file content: {file_size} bytes")
-            data = b''
-            while len(data) < file_size:
-                chunk = client_socket.recv(min(buffer_size, file_size - len(data)))
-                if not chunk:
-                    break
-                data += chunk
+            data = self._receive_exact(client_socket, file_size, buffer_size=buffer_size)
+            if len(data) != file_size:
+                self.logger.warning(
+                    f"Incomplete file content: expected {file_size} bytes, got {len(data)}"
+                )
             
             self.logger.info(f"Received {len(data)} bytes")
             return data

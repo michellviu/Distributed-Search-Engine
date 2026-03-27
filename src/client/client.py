@@ -39,6 +39,13 @@ class SearchClient:
     El cliente es agnóstico al sistema distribuido - simplemente se conecta
     a un endpoint (que puede ser un load balancer o un nodo directo).
     """
+
+    CONNECT_TIMEOUT = 5.0
+    DEFAULT_SOCKET_TIMEOUT = 10.0
+    UPLOAD_BASE_TIMEOUT = 60.0
+    UPLOAD_SECONDS_PER_MB = 2.0
+    MAX_UPLOAD_TIMEOUT = 1800.0
+    FILE_CHUNK_SIZE = 1024 * 1024
     
     def __init__(self, server_host: str = None, server_port: int = None):
         """
@@ -134,10 +141,18 @@ class SearchClient:
         except:
             return self.server_host, self.server_port
 
+    def _estimate_index_timeout(self, file_size: int) -> float:
+        """Calcula timeout dinámico para indexación según tamaño del archivo."""
+        size_mb = max(1.0, file_size / (1024 * 1024))
+        estimated = self.UPLOAD_BASE_TIMEOUT + (size_mb * self.UPLOAD_SECONDS_PER_MB)
+        return min(max(estimated, self.DEFAULT_SOCKET_TIMEOUT), self.MAX_UPLOAD_TIMEOUT)
+
     def _execute_with_failover(self, operation_name: str, func, *args, **kwargs) -> Any:
         """
         Ejecuta una operación de red con reintentos y cambio automático de coordinador.
         """
+        socket_timeout = kwargs.pop('_socket_timeout', self.DEFAULT_SOCKET_TIMEOUT)
+
         # Intentar con varios nodos si el primero falla
         max_attempts = len(self.discovery.get_coordinators()) + 1
         attempts = 0
@@ -149,8 +164,11 @@ class SearchClient:
             try:
                 # self.logger.debug(f"Conectando a {host}:{port} para {operation_name}")
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                    sock.settimeout(5.0)
+                    sock.settimeout(self.CONNECT_TIMEOUT)
                     sock.connect((host, port))
+
+                    # Timeout específico para lectura/escritura de la operación.
+                    sock.settimeout(socket_timeout)
                     
                     # Intentar actualizar topología si es la primera vez que conectamos con éxito
                     if not self._topology_updated:
@@ -224,26 +242,36 @@ class SearchClient:
         file_path_obj = Path(file_path)
         if not file_path_obj.exists():
             return False
-            
+
         try:
-            with open(file_path, 'rb') as f:
-                file_content = f.read()
-        except:
+            file_size = file_path_obj.stat().st_size
+        except Exception:
             return False
 
         def _do_index(sock):
             request = {
                 'action': 'index',
                 'file_name': file_path_obj.name,
-                'file_size': len(file_content)
+                'file_size': file_size
             }
             self._send_request(sock, request)
-            sock.sendall(file_content)
+
+            with open(file_path, 'rb') as source_file:
+                while True:
+                    chunk = source_file.read(self.FILE_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    sock.sendall(chunk)
+
             response = self._receive_response(sock)
             
             return response.get('status') == 'success'
 
-        result = self._execute_with_failover('index', _do_index)
+        result = self._execute_with_failover(
+            'index',
+            _do_index,
+            _socket_timeout=self._estimate_index_timeout(file_size)
+        )
         return result if result is not None else False
     # ... (métodos originales se mantienen abajo si no coinciden) ...
         """
